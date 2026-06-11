@@ -34,6 +34,7 @@ done
 
 PYTHON="${PYTHON:-python3}"
 PARSE_TRACK="${scripts_dir}/parse_bmge_track.py"
+BACKTRANSLATE="${scripts_dir}/backtranslate_from_prot.py"
 BMGE_TIMEOUT=300   # seconds before assuming MST bug
 
 wait_for_slot() {
@@ -72,16 +73,19 @@ with open(path, 'w') as fh:
 PYEOF
     }
 
-    # Run BMGE (with timeout guard)
+    # Run BMGE (with timeout guard).
+    # NOTE: -of is intentionally omitted — BMGE 1.12 (bioconda) has a known
+    # bug where -t CODON truncates the FASTA nucleotide output to protein
+    # length. The correct CDS is reconstructed via back-translation below.
     run_once() {
         local in_fa="$1"
         timeout "$BMGE_TIMEOUT" bmge \
-            -i  "$in_fa" \
-            -t  CODON \
-            -g  "$gap_thresh" \
-            -h  "$entropy_thresh" \
-            -of "$trim_out" \
-            -oh "$track_out" \
+            -i    "$in_fa" \
+            -t    CODON \
+            -m    "$matrix" \
+            -g    "$gap_thresh" \
+            -h    "$entropy_thresh" \
+            -oh   "$track_out" \
             -oaaf "$prot_out"
     }
 
@@ -100,7 +104,6 @@ PYEOF
         exit_code=$?
 
         # Strip sentinel from all outputs regardless of exit code
-        strip_sentinel "$trim_out"
         strip_sentinel "$prot_out"
         # track HTML: strip sentinel entry (best-effort)
         [[ -f "$track_out" ]] && sed -i '/BMGE_SENTINEL_DUPE/d' "$track_out" || true
@@ -115,9 +118,25 @@ PYEOF
     fi
 
     # Drop empty outputs
-    for f in "$trim_out" "$track_out" "$prot_out"; do
+    for f in "$track_out" "$prot_out"; do
         [[ ! -s "$f" ]] && rm -f "$f"
     done
+
+    # Back-translate protein alignment → correct CDS alignment.
+    # BMGE's -of is broken in CODON mode (truncates to protein length);
+    # we reconstruct the CDS by mapping the protein alignment back to
+    # the original gap-stripped codons.
+    if [[ -s "$prot_out" ]]; then
+        if ! "$PYTHON" "$BACKTRANSLATE" \
+                --prot "$prot_out" \
+                --cds  "$fasta" \
+                --out  "$trim_out" 2>&1; then
+            echo "[BMGE] WARN: back-translation failed for $gene_id, skipping" >&2
+            rm -f "$trim_out" "$track_out" "$prot_out"
+            return
+        fi
+        [[ ! -s "$trim_out" ]] && rm -f "$trim_out"
+    fi
 
     echo "[BMGE] OK: $gene_id"
 }
