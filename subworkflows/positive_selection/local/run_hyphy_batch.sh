@@ -13,6 +13,7 @@ cpu_each=4
 methods="FUBAR,FEL"
 scripts_dir=""
 filter_fasta=""   # set below from scripts_dir
+taxid_tsv=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -21,6 +22,7 @@ while [[ $# -gt 0 ]]; do
         --cpu-each)    cpu_each="$2";    shift 2 ;;
         --methods)     methods="$2";     shift 2 ;;
         --scripts-dir) scripts_dir="$2"; shift 2 ;;
+        --taxid-tsv)   taxid_tsv="$2";   shift 2 ;;
         *) echo "[HYPHY] Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -48,10 +50,14 @@ run_hyphy_gene() {
     # not prune the FASTA to match the tree — species absent from the
     # species tree remain in the FASTA, causing HyPhy tip-count mismatches.
     local filtered_fasta="${gene_id}.tree_filtered.fa"
+    local taxid_arg=""
+    [[ -n "$taxid_tsv" ]] && taxid_arg="--taxid-tsv $taxid_tsv"
+
     if ! python3 "$filter_fasta" \
             --fasta "$fasta" \
             --tree  "$tree" \
-            --out   "$filtered_fasta" 2>&1; then
+            --out   "$filtered_fasta" \
+            $taxid_arg 2>&1; then
         echo "[HYPHY] WARN: FASTA filtering failed for ${gene_id}, skipping" >&2
         return
     fi

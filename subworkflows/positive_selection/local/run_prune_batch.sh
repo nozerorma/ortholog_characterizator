@@ -8,6 +8,7 @@ manifest=""
 workers=4
 species_tree=""
 scripts_dir=""
+taxid_tsv=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -15,6 +16,7 @@ while [[ $# -gt 0 ]]; do
         --workers)      workers="$2";       shift 2 ;;
         --species-tree) species_tree="$2";  shift 2 ;;
         --scripts-dir)  scripts_dir="$2";   shift 2 ;;
+        --taxid-tsv)    taxid_tsv="$2";     shift 2 ;;
         *) echo "[PRUNE] Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -41,10 +43,14 @@ while IFS=$'\t' read -r gene_id fasta_name; do
     (
         out_tree="${gene_id}.pruned.nwk"
         # prune_tree_for_gene.py: --tree, --fasta, --out, [--min_taxa]
+        taxid_arg=""
+        [[ -n "$taxid_tsv" ]] && taxid_arg="--taxid-tsv $taxid_tsv"
+
         if "$PYTHON" "$PRUNE_PY" \
                 --fasta "$fasta_name" \
                 --tree  "$species_tree" \
-                --out   "$out_tree" 2>&1; then
+                --out   "$out_tree" \
+                $taxid_arg 2>&1; then
             [[ ! -s "$out_tree" ]] && rm -f "$out_tree"
             echo "[PRUNE] OK: $gene_id"
         else

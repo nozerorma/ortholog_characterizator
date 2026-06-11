@@ -64,7 +64,8 @@ process PRUNE_TREE_BATCH {
 
     script:
     // prune_tree_for_gene.py: --tree, --fasta, --out, [--min_taxa]
-    def workers = params.psel_batch_workers as int
+    def workers    = params.psel_batch_workers as int
+    def taxid_arg  = params.taxid_tsv ? "--taxid-tsv '${params.taxid_tsv}'" : ''
     """
     cat > manifest.tsv << 'MANIFEST_EOF'
 ${manifest_text}
@@ -74,7 +75,8 @@ MANIFEST_EOF
         --manifest     manifest.tsv \\
         --workers      ${workers} \\
         --species-tree "${species_tree}" \\
-        --scripts-dir  "${projectDir}/subworkflows/positive_selection/local"
+        --scripts-dir  "${projectDir}/subworkflows/positive_selection/local" \\
+        ${taxid_arg}
     """
 }
 
@@ -92,8 +94,9 @@ process HYPHY_BATCH {
     tuple val(batch_id), path("*.SLAC.json"),  optional: true, emit: slac_json
 
     script:
-    def workers  = params.psel_batch_workers as int
-    def cpu_each = Math.max(1, (task.cpus as int).intdiv(workers))
+    def workers   = params.psel_batch_workers as int
+    def cpu_each  = Math.max(1, (task.cpus as int).intdiv(workers))
+    def taxid_arg = params.taxid_tsv ? "--taxid-tsv '${params.taxid_tsv}'" : ''
     """
     cat > manifest.tsv << 'MANIFEST_EOF'
 ${manifest_text}
@@ -104,7 +107,8 @@ MANIFEST_EOF
         --workers     ${workers} \\
         --cpu-each    ${cpu_each} \\
         --methods     "${params.hyphy_methods}" \\
-        --scripts-dir "${projectDir}/subworkflows/positive_selection/local"
+        --scripts-dir "${projectDir}/subworkflows/positive_selection/local" \\
+        ${taxid_arg}
     """
 }
 
