@@ -12,6 +12,7 @@ workers=4
 cpu_each=4
 methods="FUBAR,FEL"
 scripts_dir=""
+filter_fasta=""   # set below from scripts_dir
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -26,6 +27,8 @@ done
 
 [[ -z "$manifest"    ]] && { echo "[HYPHY] --manifest is required"    >&2; exit 1; }
 
+filter_fasta="${scripts_dir}/filter_fasta_to_tree.py"
+
 # Parse methods into array
 IFS=',' read -ra METHOD_LIST <<< "$methods"
 
@@ -39,6 +42,20 @@ run_hyphy_gene() {
     local gene_id="$1"
     local fasta="$2"
     local tree="$3"
+
+    # Filter FASTA to sequences present in the pruned tree.
+    # prune_tree_for_gene.py prunes the tree to match the FASTA, but does
+    # not prune the FASTA to match the tree — species absent from the
+    # species tree remain in the FASTA, causing HyPhy tip-count mismatches.
+    local filtered_fasta="${gene_id}.tree_filtered.fa"
+    if ! python3 "$filter_fasta" \
+            --fasta "$fasta" \
+            --tree  "$tree" \
+            --out   "$filtered_fasta" 2>&1; then
+        echo "[HYPHY] WARN: FASTA filtering failed for ${gene_id}, skipping" >&2
+        return
+    fi
+    fasta="$filtered_fasta"
 
     # Cap BLAS/OpenMP threads to the per-worker CPU allocation.
     # HyPhy's CPU argument only controls its own scheduler; library-level
