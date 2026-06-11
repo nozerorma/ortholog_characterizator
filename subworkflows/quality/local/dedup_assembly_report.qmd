@@ -1,0 +1,1318 @@
+---
+title: "Duplicate Assembly Characterisation Report"
+date: today
+format:
+  html:
+    toc: true
+    toc-float: true
+    toc-depth: 3
+    theme: flatly
+    code-fold: true
+    embed-resources: false
+    fig-width: 11
+    fig-height: 6
+  typst:
+    toc: true
+jupyter: python3
+execute:
+  dir: file
+---
+
+```{=html}
+<style>
+.cell-output-display { margin-top: 2.2em; }
+h2, h3, h4 { margin-top: 1.8em; margin-bottom: 1.1em; }
+.nav-tabs   { margin-bottom: 1.4em; }
+</style>
+```
+
+```{python}
+#| label: setup
+#| echo: false
+
+import os, re, sys, pickle, warnings, multiprocessing
+from collections import defaultdict
+from datetime import datetime
+from itertools import combinations
+from pathlib import Path
+
+import numpy  as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from joblib import Parallel, delayed
+from itables import show as ishow
+import itables.options as ito
+
+warnings.filterwarnings("ignore")
+
+# ── Parameters ─────────────────────────────────────────────────────────────────
+# Path to the CDS alignment directory (.fa files, one file per gene)
+DIR_CDS       = "/data/samanthafs/scratch/lab_anavarro/mramon/4.Generate_alignments_from_codons/alignments/Mammals_cds"
+FASTA_EXT     = ".fa"
+
+# Pipeline stage alignment directories (FASTA_EXT applies to all)
+DIR_DEDUP     = "/data/samanthafs/scratch/lab_anavarro/mramon/4.Generate_alignments_from_codons/alignments/Mammals_BMGE_20260409_234008_frozen/DEDUP"
+DIR_CHI2      = "/data/samanthafs/scratch/lab_anavarro/mramon/4.Generate_alignments_from_codons/alignments/Mammals_BMGE_20260409_234008_frozen/PREFILTER"
+DIR_TRIM      = "/data/samanthafs/scratch/lab_anavarro/mramon/4.Generate_alignments_from_codons/alignments/Mammals_BMGE_20260409_234008_frozen/TRIM"
+
+# TSV inputs
+DEDUP_MAP_TSV = "/data/samanthafs/scratch/lab_anavarro/mramon/4.Generate_alignments_from_codons/taxa_info/species_dedup_map.tsv"
+METADATA_TSV  = "/data/samanthafs/scratch/lab_anavarro/mramon/4.Generate_alignments_from_codons/taxa_info/assemblies_and_species.tsv"
+
+# Species tree — tips are assembly names (e.g. HLcanLup8).
+# Set to None or "" to skip the tree section.
+PHYLO_NWK     = "/data/samanthafs/scratch/lab_anavarro/mramon/4.Generate_alignments_from_codons/external_phylogenies/speciesTree_assemblyname.nh"
+
+# Cache
+CACHE_DIR     = "/data/samanthafs/scratch/lab_anavarro/mramon/4.Generate_alignments_from_codons/reports/tmp/mammals/dedup_report_cache"
+
+N_JOBS        = -1   # parallel workers for annotation index build
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+T10 = px.colors.qualitative.T10
+PLOTLY_TPL = "plotly_white"
+
+def hex_rgba(h, a=0.35):
+    r, g, b = int(h[1:3],16), int(h[3:5],16), int(h[5:7],16)
+    return f"rgba({r},{g},{b},{a})"
+
+IS_PDF = os.environ.get("RENDER_FORMAT","html") == "pdf"
+
+def show_fig(fig, height=None):
+    if fig.layout.annotations:
+        t = fig.layout.margin.t if fig.layout.margin.t else 50
+        fig.update_layout(margin_t=max(t, 90))
+    if IS_PDF:
+        from IPython.display import Image, display
+        display(Image(fig.to_image(format="png", width=1400, height=height or 600, scale=2)))
+    else:
+        fig.show()
+
+def show_table(df, caption="", **kwargs):
+    if IS_PDF:
+        from IPython.display import Markdown, display
+        hdr = f"**{caption}**\n\n" if caption else ""
+        try:    display(Markdown(hdr + df.to_markdown(index=False)))
+        except: display(Markdown(hdr + df.to_string()))
+    else:
+        ishow(df, caption=caption, **kwargs)
+
+os.makedirs(CACHE_DIR, exist_ok=True)
+ito.style   = "table-layout:auto;width:100%;margin:auto"
+ito.classes = "display compact"
+
+print(f"Python {sys.version.split()[0]}  |  {datetime.now():%Y-%m-%d %H:%M}")
+print(f"CPUs: {multiprocessing.cpu_count()}  |  N_JOBS={N_JOBS}")
+```
+
+---
+
+# 1. Data Loading {.tabset}
+
+## Dedup map
+
+```{python}
+#| label: load-dedup
+
+dedup = pd.read_csv(DEDUP_MAP_TSV, sep="\t", dtype=str)
+# Columns: assembly_name | canonical_group | species_in_data
+
+# Classify each assembly:
+#   replicate  → species_in_data == canonical_group  (same nominal species, different assembly)
+#   subspecies → species_in_data != canonical_group  (trinomial name belonging to a canonical group)
+dedup["asm_type"] = np.where(
+    dedup["species_in_data"] == dedup["canonical_group"],
+    "replicate", "subspecies"
+)
+
+print(f"Dedup map: {len(dedup):,} assemblies, {dedup['canonical_group'].nunique():,} canonical groups")
+print(dedup["asm_type"].value_counts().to_string())
+```
+
+## Metadata
+
+```{python}
+#| label: load-meta
+
+_KNOWN_ORDERS = {
+    "Primates","Rodentia","Carnivora","Chiroptera","Artiodactyla",
+    "Cetartiodactyla","Cetacea","Perissodactyla","Lagomorpha",
+    "Eulipotyphla","Insectivora","Proboscidea","Sirenia","Pilosa",
+    "Cingulata","Didelphimorphia","Monotremata","Diprotodontia",
+    "Polyprotodontia","Scandentia","Dermoptera","Hyracoidea",
+    "Tubulidentata","Pholidota","Macroscelidea","Afrosoricida",
+    "Erinaceomorpha","Soricomorpha","Notoryctemorphia","Microbiotheria",
+}
+
+def _extract_order(lineage):
+    if not isinstance(lineage, str): return "Unknown"
+    for part in [p.strip() for p in lineage.split(";")]:
+        if part.endswith("formes") or part.endswith("iformes"): return part
+        if part in _KNOWN_ORDERS: return part
+    return "Unknown"
+
+def _to_int(s):
+    return pd.to_numeric(s.str.replace(",","",regex=False), errors="coerce").astype("Int64")
+
+meta_raw = pd.read_csv(METADATA_TSV, sep="\t", dtype=str)
+meta = (meta_raw
+    .rename(columns={
+        "Assembly name":                       "assembly",
+        "Species":                             "species",
+        "NCBI assembly status":                "ncbi_status",
+        "Taxonomic Lineage":                   "lineage",
+        "scaffold N50 (bp)":                   "scaffold_n50",
+        "contig N50 (bp)":                     "contig_n50",
+        "No. ancestral genes with intact ORF": "intact_orf",
+    })
+    [["assembly","species","ncbi_status","lineage","scaffold_n50","contig_n50","intact_orf"]]
+    .copy()
+)
+for col in ["scaffold_n50","contig_n50","intact_orf"]:
+    meta[col] = _to_int(meta[col])
+meta["order"] = meta["lineage"].apply(_extract_order)
+meta["ncbi_status"] = meta["ncbi_status"].fillna("Unknown")
+
+print(f"Metadata: {len(meta):,} records")
+```
+
+## Merged table
+
+```{python}
+#| label: merge
+
+# Join dedup map with assembly metadata
+df = (dedup
+    .merge(meta, left_on="assembly_name", right_on="assembly", how="left")
+    .drop(columns=["assembly"])
+)
+
+# Per-canonical-group summary
+grp = (df.groupby("canonical_group")
+    .agg(
+        n_total      = ("assembly_name", "count"),
+        n_replicates = ("asm_type",      lambda x: (x == "replicate").sum()),
+        n_subspecies = ("asm_type",      lambda x: (x == "subspecies").sum()),
+        assemblies   = ("assembly_name", lambda x: "|".join(sorted(x))),
+        species_names= ("species_in_data",lambda x: "|".join(sorted(x.unique()))),
+        order        = ("order",          "first"),
+    )
+    .reset_index()
+)
+
+print(f"Canonical groups with duplicates: {len(grp):,}")
+print(f"  replicate-only:  {(grp.n_subspecies == 0).sum()}")
+print(f"  subspecies-only: {(grp.n_replicates == 0).sum()}")
+print(f"  mixed (both):    {((grp.n_replicates > 0) & (grp.n_subspecies > 0)).sum()}")
+```
+
+---
+
+# 2. Assembly Counts per Canonical Species {.tabset}
+
+## Summary table
+
+```{python}
+#| label: counts-table
+
+tbl = grp[["canonical_group","order","n_total","n_replicates","n_subspecies","species_names"]].copy()
+tbl = tbl.sort_values("n_total", ascending=False).reset_index(drop=True)
+tbl.columns = ["Canonical species","Order","Total assemblies","Replicates","Subspecies","Species names in data"]
+
+show_table(tbl, caption="Assemblies per canonical species (only species with >1 assembly shown)")
+```
+
+## Count distributions
+
+```{python}
+#| label: counts-dist
+
+fig = make_subplots(rows=1, cols=3, subplot_titles=[
+    "Total assemblies per species",
+    "Replicate assemblies per species",
+    "Subspecies assemblies per species",
+])
+
+for col_i, (col, title) in enumerate([
+    ("n_total",      "Total"),
+    ("n_replicates", "Replicates"),
+    ("n_subspecies", "Subspecies"),
+], 1):
+    counts = grp[col].value_counts().sort_index()
+    fig.add_trace(
+        go.Bar(x=counts.index.astype(str), y=counts.values,
+               marker_color=T10[col_i - 1], showlegend=False,
+               name=title),
+        row=1, col=col_i
+    )
+    fig.update_xaxes(title_text="Count", row=1, col=col_i)
+    fig.update_yaxes(title_text="# canonical species", row=1, col=col_i)
+
+fig.update_layout(template=PLOTLY_TPL, height=420,
+                  title_text="Distribution of assembly multiplicities")
+show_fig(fig, height=420)
+```
+
+## Breakdown by taxonomic order
+
+```{python}
+#| label: counts-by-order
+
+_order_total = (meta.groupby("order")["species"]
+    .nunique().reset_index()
+    .rename(columns={"species": "total_species"}))
+
+order_grp = (grp.groupby("order")
+    .agg(
+        n_species_with_dups   = ("canonical_group",  "count"),
+        total_extra_assemblies = ("n_total",          lambda x: (x - 1).sum()),
+        species_with_replicates= ("n_replicates",     lambda x: (x > 0).sum()),
+        species_with_subspecies= ("n_subspecies",     lambda x: (x > 0).sum()),
+    )
+    .reset_index()
+    .merge(_order_total, on="order", how="left")
+    .sort_values("n_species_with_dups", ascending=False)
+    .reset_index(drop=True)
+)[["order","total_species","n_species_with_dups","total_extra_assemblies",
+   "species_with_replicates","species_with_subspecies"]]
+order_grp.columns = ["Order","Total species","Species with duplicates","Extra assemblies",
+                     "Species with replicates","Species with subspecies"]
+show_table(order_grp, caption="Duplicate assembly burden per taxonomic order")
+```
+
+---
+
+# 3. N50 Statistics {.tabset}
+
+## Scaffold N50
+
+```{python}
+#| label: n50-scaffold
+
+n50s = (df[["canonical_group","assembly_name","asm_type","scaffold_n50"]]
+    .dropna(subset=["scaffold_n50"])
+    .copy()
+)
+n50s["scaffold_n50"] = n50s["scaffold_n50"].astype(float)
+
+# Per-group stats
+n50s_grp = (n50s.groupby("canonical_group")["scaffold_n50"]
+    .agg(min_scaffold_n50="min", max_scaffold_n50="max")
+    .assign(scaffold_n50_range=lambda x: x["max_scaffold_n50"] - x["min_scaffold_n50"])
+    .reset_index()
+    .sort_values("scaffold_n50_range", ascending=False)
+)
+
+fig = px.histogram(
+    n50s_grp, x="scaffold_n50_range", nbins=60,
+    color_discrete_sequence=[T10[0]],
+    labels={"scaffold_n50_range": "N50 range (bp)"},
+    title="Scaffold N50 range within duplicate groups",
+    template=PLOTLY_TPL,
+)
+fig.update_layout(yaxis_title="# canonical species")
+show_fig(fig, height=400)
+
+show_table(
+    n50s_grp
+    .rename(columns={"canonical_group":"Canonical species",
+                     "min_scaffold_n50":"Min scaffold N50",
+                     "max_scaffold_n50":"Max scaffold N50",
+                     "scaffold_n50_range":"N50 range"}),
+    caption="All species by scaffold N50 spread across assemblies"
+)
+```
+
+## Contig N50
+
+```{python}
+#| label: n50-contig
+
+n50c = (df[["canonical_group","assembly_name","asm_type","contig_n50"]]
+    .dropna(subset=["contig_n50"])
+    .copy()
+)
+n50c["contig_n50"] = n50c["contig_n50"].astype(float)
+
+n50c_grp = (n50c.groupby("canonical_group")["contig_n50"]
+    .agg(min_contig_n50="min", max_contig_n50="max")
+    .assign(contig_n50_range=lambda x: x["max_contig_n50"] - x["min_contig_n50"])
+    .reset_index()
+    .sort_values("contig_n50_range", ascending=False)
+)
+
+fig = px.histogram(
+    n50c_grp, x="contig_n50_range", nbins=60,
+    color_discrete_sequence=[T10[1]],
+    labels={"contig_n50_range": "N50 range (bp)"},
+    title="Contig N50 range within duplicate groups",
+    template=PLOTLY_TPL,
+)
+fig.update_layout(yaxis_title="# canonical species")
+show_fig(fig, height=400)
+
+show_table(
+    n50c_grp
+    .rename(columns={"canonical_group":"Canonical species",
+                     "min_contig_n50":"Min contig N50",
+                     "max_contig_n50":"Max contig N50",
+                     "contig_n50_range":"N50 range"}),
+    caption="All species by contig N50 spread across assemblies"
+)
+```
+
+## Per-assembly N50 detail
+
+```{python}
+#| label: n50-per-assembly
+
+n50_detail = (df[["canonical_group","assembly_name","asm_type",
+                   "species_in_data","scaffold_n50","contig_n50","ncbi_status"]]
+    .rename(columns={
+        "canonical_group":  "Canonical species",
+        "assembly_name":    "Assembly",
+        "asm_type":         "Type",
+        "species_in_data":  "Species in data",
+        "scaffold_n50":     "Scaffold N50",
+        "contig_n50":       "Contig N50",
+        "ncbi_status":      "NCBI status",
+    })
+    .sort_values(["Canonical species","Assembly"])
+    .reset_index(drop=True)
+)
+show_table(n50_detail, caption="Per-assembly N50 values for all duplicate groups")
+```
+
+## N50 scatter (scaffold vs contig)
+
+```{python}
+#| label: n50-scatter
+
+plot_df = (df[["canonical_group","assembly_name","asm_type","scaffold_n50","contig_n50"]]
+    .dropna(subset=["scaffold_n50","contig_n50"])
+    .copy()
+)
+plot_df["scaffold_n50"] = plot_df["scaffold_n50"].astype(float)
+plot_df["contig_n50"]   = plot_df["contig_n50"].astype(float)
+
+fig = px.scatter(
+    plot_df,
+    x="contig_n50", y="scaffold_n50",
+    color="asm_type",
+    hover_name="assembly_name",
+    hover_data={"canonical_group": True, "asm_type": False},
+    log_x=True, log_y=True,
+    color_discrete_map={"replicate": T10[0], "subspecies": T10[1]},
+    labels={"contig_n50":"Contig N50 (log bp)",
+            "scaffold_n50":"Scaffold N50 (log bp)",
+            "asm_type":"Assembly type"},
+    title="Scaffold vs Contig N50 for all duplicate assemblies",
+    template=PLOTLY_TPL,
+)
+fig.update_traces(marker_size=5, marker_opacity=0.7)
+show_fig(fig, height=500)
+```
+
+---
+
+# 4. Annotation Coverage per Assembly {.tabset}
+
+Annotation counts are derived from the CDS alignment files: an assembly is
+considered annotated for a given gene if its sequence appears (as a FASTA
+header `>assembly_name`) in that gene's alignment file.
+
+## Build annotation index
+
+```{python}
+#| label: annot-index
+
+_ANNOT_CACHE = os.path.join(CACHE_DIR, "annot_index.pkl")
+
+def _assemblies_in_file(fp: str) -> tuple[str, list[str]]:
+    """Return (gene_name, [assembly_names]) for one alignment file."""
+    gene = Path(fp).stem
+    asms = []
+    try:
+        with open(fp) as fh:
+            for line in fh:
+                if line.startswith(">"):
+                    asms.append(line[1:].split()[0])
+    except Exception:
+        pass
+    return gene, asms
+
+if os.path.exists(_ANNOT_CACHE):
+    print("[cache] Loading annotation index …")
+    with open(_ANNOT_CACHE, "rb") as _f:
+        annot_index = pickle.load(_f)  # dict: assembly_name → set of gene names
+else:
+    cds_files = sorted(Path(DIR_CDS).glob(f"*{FASTA_EXT}"))
+    print(f"Building annotation index from {len(cds_files):,} CDS files …")
+    _t0 = datetime.now()
+    _results = Parallel(n_jobs=N_JOBS, backend="threading", verbose=0)(
+        delayed(_assemblies_in_file)(str(fp)) for fp in cds_files
+    )
+    annot_index: dict[str, set[str]] = defaultdict(set)
+    for gene, asms in _results:
+        for asm in asms:
+            annot_index[asm].add(gene)
+    annot_index = dict(annot_index)
+    print(f"  done in {(datetime.now()-_t0).seconds}s  |  {len(annot_index):,} assemblies indexed")
+    with open(_ANNOT_CACHE, "wb") as _f:
+        pickle.dump(annot_index, _f, protocol=pickle.HIGHEST_PROTOCOL)
+
+# Annotation counts per assembly
+annot_counts = {asm: len(genes) for asm, genes in annot_index.items()}
+print(f"Assemblies with ≥1 annotation: {len(annot_counts):,}")
+```
+
+## Per-assembly annotation counts
+
+```{python}
+#| label: annot-counts
+
+df["n_annotations"] = df["assembly_name"].map(annot_counts).fillna(0).astype(int)
+
+annot_tbl = (df[["canonical_group","assembly_name","asm_type",
+                  "species_in_data","n_annotations","scaffold_n50","ncbi_status"]]
+    .rename(columns={
+        "canonical_group": "Canonical species",
+        "assembly_name":   "Assembly",
+        "asm_type":        "Type",
+        "species_in_data": "Species in data",
+        "n_annotations":   "Annotated genes",
+        "scaffold_n50":    "Scaffold N50",
+        "ncbi_status":     "NCBI status",
+    })
+    .sort_values(["Canonical species","Assembly"])
+    .reset_index(drop=True)
+)
+show_table(annot_tbl, caption="Annotation counts per assembly")
+```
+
+## Per-group annotation statistics
+
+```{python}
+#| label: annot-stats
+
+annot_grp = (df.groupby("canonical_group")
+    .agg(
+        min_annotations   = ("n_annotations", "min"),
+        max_annotations   = ("n_annotations", "max"),
+        range_annotations = ("n_annotations", lambda x: x.max() - x.min()),
+        mean_annotations  = ("n_annotations", lambda x: round(x.mean(), 1)),
+        assemblies        = ("assembly_name", lambda x: "|".join(sorted(x))),
+    )
+    .sort_values("range_annotations", ascending=False)
+    .reset_index()
+)
+
+fig = px.histogram(
+    annot_grp, x="range_annotations", nbins=60,
+    color_discrete_sequence=[T10[2]],
+    labels={"range_annotations": "Annotation range (# genes)"},
+    title="Spread of annotated gene counts within duplicate groups",
+    template=PLOTLY_TPL,
+)
+fig.update_layout(yaxis_title="# canonical species")
+show_fig(fig, height=400)
+
+show_table(
+    annot_grp.drop(columns=["assemblies"])
+    .rename(columns={
+        "canonical_group":   "Canonical species",
+        "min_annotations":   "Min",
+        "max_annotations":   "Max",
+        "range_annotations": "Range",
+        "mean_annotations":  "Mean",
+    }),
+    caption="All species by annotation count spread between assemblies"
+)
+```
+
+## Pairwise gene set comparison
+
+For each canonical species, every pair of assemblies is compared to reveal
+genes **unique to assembly A**, **unique to B**, and **shared by both**.
+
+```{python}
+#| label: annot-pairwise
+
+_PAIR_CACHE = os.path.join(CACHE_DIR, "pairwise_annot.pkl")
+
+def _pairwise_one(canonical: str, asm_list: list[str]) -> list[dict]:
+    rows = []
+    for a, b in combinations(sorted(asm_list), 2):
+        genes_a = annot_index.get(a, set())
+        genes_b = annot_index.get(b, set())
+        shared   = genes_a & genes_b
+        only_a   = genes_a - genes_b
+        only_b   = genes_b - genes_a
+        rows.append(dict(
+            canonical=canonical,
+            assembly_A=a, assembly_B=b,
+            n_A=len(genes_a), n_B=len(genes_b),
+            n_shared=len(shared),
+            n_only_A=len(only_a),
+            n_only_B=len(only_b),
+            jaccard=len(shared) / len(genes_a | genes_b) if (genes_a | genes_b) else np.nan,
+            genes_only_A="|".join(sorted(only_a)),
+            genes_only_B="|".join(sorted(only_b)),
+        ))
+    return rows
+
+if os.path.exists(_PAIR_CACHE):
+    print("[cache] Loading pairwise comparison …")
+    with open(_PAIR_CACHE, "rb") as _f:
+        df_pairs = pickle.load(_f)
+else:
+    _asm_per_canon = (df.groupby("canonical_group")["assembly_name"]
+                      .apply(list).to_dict())
+    _pair_rows = Parallel(n_jobs=N_JOBS, backend="threading", verbose=0)(
+        delayed(_pairwise_one)(canon, asms)
+        for canon, asms in _asm_per_canon.items()
+    )
+    df_pairs = pd.DataFrame([r for sub in _pair_rows for r in sub])
+    with open(_PAIR_CACHE, "wb") as _f:
+        pickle.dump(df_pairs, _f, protocol=pickle.HIGHEST_PROTOCOL)
+
+print(f"Assembly pairs evaluated: {len(df_pairs):,}")
+print(f"Mean Jaccard similarity: {df_pairs['jaccard'].mean():.3f}")
+```
+
+```{python}
+#| label: annot-pairwise-plot
+
+fig = make_subplots(rows=1, cols=2,
+    subplot_titles=["Jaccard similarity distribution",
+                    "Unique-to-A vs Unique-to-B"])
+
+from scipy.stats import gaussian_kde as _kde
+
+_jac = df_pairs["jaccard"].dropna().values
+if len(_jac) > 1:
+    x_j = np.linspace(_jac.min(), _jac.max(), 300)
+    y_j = _kde(_jac)(x_j)
+    fig.add_trace(go.Scatter(x=x_j, y=y_j, fill="tozeroy",
+                             fillcolor=hex_rgba(T10[0]),
+                             line=dict(color=T10[0], width=2),
+                             name="Jaccard", showlegend=False),
+                  row=1, col=1)
+
+fig.add_trace(go.Scatter(
+    x=df_pairs["n_only_A"], y=df_pairs["n_only_B"],
+    mode="markers",
+    marker=dict(color=T10[1], size=4, opacity=0.5),
+    text=df_pairs["canonical"] + "<br>" + df_pairs["assembly_A"] + " vs " + df_pairs["assembly_B"],
+    name="pairs", showlegend=False,
+), row=1, col=2)
+
+fig.update_xaxes(title_text="Jaccard", row=1, col=1)
+fig.update_yaxes(title_text="Density", row=1, col=1)
+fig.update_xaxes(title_text="Genes unique to A", row=1, col=2)
+fig.update_yaxes(title_text="Genes unique to B", row=1, col=2)
+fig.update_layout(template=PLOTLY_TPL, height=450,
+                  title_text="Pairwise annotation overlap between duplicate assemblies")
+show_fig(fig, height=450)
+```
+
+```{python}
+#| label: annot-pairwise-table
+
+show_table(
+    df_pairs[["canonical","assembly_A","assembly_B",
+              "n_A","n_B","n_shared","n_only_A","n_only_B","jaccard"]]
+    .sort_values("n_only_A", ascending=False)
+    .rename(columns={
+        "canonical":  "Canonical species",
+        "assembly_A": "Assembly A",
+        "assembly_B": "Assembly B",
+        "n_A":        "Genes A",
+        "n_B":        "Genes B",
+        "n_shared":   "Shared",
+        "n_only_A":   "Only in A",
+        "n_only_B":   "Only in B",
+        "jaccard":    "Jaccard",
+    }),
+    caption="All pairs by genes unique to A"
+)
+```
+
+## Annotations vs N50 (pairwise)
+
+For each assembly pair within a canonical group, do we see the expected
+relationship — higher N50 → more annotated genes?  Each point is one pair;
+axes show the **signed difference** (A minus B).  Points in Q1 / Q3 are
+**concordant** (higher N50 co-occurs with more annotations); Q2 / Q4 are
+**discordant** (lower-continuity assembly has more annotations).
+
+```{python}
+#| label: annot-n50-pairwise
+
+# ── Pull N50s for every assembly in the pairs table ───────────────────────────
+_n50_lu = (df[["assembly_name","scaffold_n50","contig_n50","asm_type"]]
+           .drop_duplicates("assembly_name")
+           .set_index("assembly_name"))
+
+_pairs_n50 = df_pairs.copy()
+for _side, _col in [("A","scaffold_n50"),("A","contig_n50"),
+                    ("B","scaffold_n50"),("B","contig_n50")]:
+    _asm_col = f"assembly_{_side}"
+    _pairs_n50[f"{_col}_{_side}"] = (
+        _pairs_n50[_asm_col].map(_n50_lu[_col]).astype(float)
+    )
+
+# Signed differences: positive = A higher than B
+_pairs_n50["d_scaffold"] = _pairs_n50["scaffold_n50_A"] - _pairs_n50["scaffold_n50_B"]
+_pairs_n50["d_contig"]   = _pairs_n50["contig_n50_A"]   - _pairs_n50["contig_n50_B"]
+_pairs_n50["d_annot"]    = (_pairs_n50["n_A"] - _pairs_n50["n_B"]).astype(float)
+
+def _concordance(d_n50, d_annot):
+    if pd.isna(d_n50) or pd.isna(d_annot): return "NA"
+    if d_n50 == 0 and d_annot != 0: return "same N50, diff annotations"
+    if (d_n50 > 0 and d_annot > 0) or (d_n50 < 0 and d_annot < 0): return "concordant"
+    if (d_n50 > 0 and d_annot < 0) or (d_n50 < 0 and d_annot > 0): return "discordant"
+    return "tied"
+
+_pairs_n50["concordance_scaffold"] = [
+    _concordance(a, b) for a, b in zip(_pairs_n50["d_scaffold"], _pairs_n50["d_annot"])
+]
+_pairs_n50["concordance_contig"] = [
+    _concordance(a, b) for a, b in zip(_pairs_n50["d_contig"], _pairs_n50["d_annot"])
+]
+
+_pal_conc = {
+    "concordant":              T10[2],
+    "discordant":              T10[3],
+    "same N50, diff annotations": T10[5],
+    "tied":                    "#cccccc",
+    "NA":                      "#eeeeee",
+}
+
+# ── Scatter plots ──────────────────────────────────────────────────────────────
+fig = make_subplots(
+    rows=1, cols=2,
+    subplot_titles=[
+        "Scaffold N50 difference vs annotation difference",
+        "Contig N50 difference vs annotation difference",
+    ],
+)
+
+for col_i, (d_col, conc_col, label) in enumerate([
+    ("d_scaffold", "concordance_scaffold", "ΔScaffold N50 (A − B, bp)"),
+    ("d_contig",   "concordance_contig",   "ΔContig N50 (A − B, bp)"),
+], 1):
+    _sub = _pairs_n50.dropna(subset=[d_col, "d_annot"])
+    for cat, color in _pal_conc.items():
+        _s = _sub[_sub[conc_col] == cat]
+        if _s.empty: continue
+        fig.add_trace(go.Scatter(
+            x=_s[d_col], y=_s["d_annot"],
+            mode="markers",
+            marker=dict(color=color, size=4, opacity=0.6),
+            name=cat,
+            showlegend=(col_i == 1),
+            text=_s["canonical"] + "<br>" + _s["assembly_A"] + " vs " + _s["assembly_B"],
+            hoverinfo="text+x+y",
+        ), row=1, col=col_i)
+    fig.add_shape(type="line", x0=0, x1=0,
+                  y0=_sub["d_annot"].min(), y1=_sub["d_annot"].max(),
+                  line=dict(color="grey", dash="dot", width=1),
+                  row=1, col=col_i)
+    fig.add_shape(type="line", y0=0, y1=0,
+                  x0=_sub[d_col].min(), x1=_sub[d_col].max(),
+                  line=dict(color="grey", dash="dot", width=1),
+                  row=1, col=col_i)
+    fig.update_xaxes(title_text=label, row=1, col=col_i)
+    fig.update_yaxes(title_text="ΔAnnotations (A − B)", row=1, col=col_i)
+
+fig.update_layout(template=PLOTLY_TPL, height=520,
+                  title_text="Within-pair concordance: N50 rank vs annotation rank",
+                  legend_title="Concordance")
+show_fig(fig, height=520)
+```
+
+```{python}
+#| label: annot-n50-pairwise-summary
+
+for metric, col in [("Scaffold N50","concordance_scaffold"),("Contig N50","concordance_contig")]:
+    _v = _pairs_n50[col].value_counts()
+    _tot = _v.sum()
+    print(f"\n{metric}:")
+    for cat, n in _v.items():
+        print(f"  {cat:30s}  {n:4d}  ({100*n/_tot:.1f}%)")
+```
+
+```{python}
+#| label: annot-n50-same-n50
+
+# Pairs where scaffold N50 is identical but annotation counts differ
+_same_n50 = (_pairs_n50[_pairs_n50["concordance_scaffold"] == "same N50, diff annotations"]
+    [["canonical","assembly_A","assembly_B",
+      "scaffold_n50_A","n_A","n_B","d_annot"]]
+    .assign(abs_diff=lambda x: x["d_annot"].abs())
+    .sort_values("abs_diff", ascending=False)
+    .drop(columns="abs_diff")
+    .rename(columns={
+        "canonical":      "Canonical species",
+        "assembly_A":     "Assembly A",
+        "assembly_B":     "Assembly B",
+        "scaffold_n50_A": "Scaffold N50 (shared)",
+        "n_A":            "Annotations A",
+        "n_B":            "Annotations B",
+        "d_annot":        "Δ Annotations (A−B)",
+    })
+    .reset_index(drop=True)
+)
+print(f"Pairs with identical scaffold N50 but different annotation counts: {len(_same_n50)}")
+show_table(_same_n50,
+    caption="Same scaffold N50, different annotations — annotation difference cannot be explained by assembly continuity")
+```
+
+## Genes unique to a single assembly
+
+```{python}
+#| label: annot-exclusive
+
+# For each assembly, find genes absent in ALL other assemblies of the same canonical group
+exclusive_rows = []
+for canon, sub in df.groupby("canonical_group"):
+    asms = sub["assembly_name"].tolist()
+    for asm in asms:
+        others = [a for a in asms if a != asm]
+        genes_asm   = annot_index.get(asm, set())
+        genes_others = set().union(*(annot_index.get(a, set()) for a in others))
+        exclusive = genes_asm - genes_others
+        exclusive_rows.append(dict(
+            canonical_group=canon,
+            assembly=asm,
+            asm_type=sub.loc[sub.assembly_name == asm, "asm_type"].values[0],
+            n_total_annotations=len(genes_asm),
+            n_exclusive=len(exclusive),
+            pct_exclusive=round(100 * len(exclusive) / len(genes_asm), 1) if genes_asm else 0,
+            exclusive_genes="|".join(sorted(exclusive)),
+        ))
+
+df_excl = pd.DataFrame(exclusive_rows).sort_values("n_exclusive", ascending=False)
+
+fig = px.histogram(
+    df_excl[df_excl.n_exclusive > 0],
+    x="pct_exclusive",
+    color="asm_type",
+    nbins=50,
+    color_discrete_map={"replicate": T10[0], "subspecies": T10[1]},
+    labels={"pct_exclusive": "% genes exclusive to this assembly",
+            "asm_type": "Type"},
+    title="Proportion of genes annotated exclusively in one assembly",
+    template=PLOTLY_TPL,
+    barmode="overlay",
+    opacity=0.7,
+)
+fig.update_layout(yaxis_title="# assemblies")
+show_fig(fig, height=400)
+
+show_table(
+    df_excl[["canonical_group","assembly","asm_type",
+             "n_total_annotations","n_exclusive","pct_exclusive"]]
+    .rename(columns={
+        "canonical_group":      "Canonical species",
+        "assembly":             "Assembly",
+        "asm_type":             "Type",
+        "n_total_annotations":  "Total annotated genes",
+        "n_exclusive":          "Exclusive genes",
+        "pct_exclusive":        "% exclusive",
+    }),
+    caption="All assemblies with genes not found in sibling assemblies"
+)
+```
+
+## Zero-annotation species
+
+Canonical groups where **no assembly** has a single annotated gene in the CDS
+alignment directory.  These are likely assemblies present in the dedup map but
+whose sequences are absent from all alignment files.
+
+```{python}
+#| label: annot-zero
+
+zero_canon = (df.groupby("canonical_group")
+    .agg(max_annot=("n_annotations","max"), order=("order","first"))
+    .reset_index()
+    .query("max_annot == 0")
+    .sort_values(["order","canonical_group"])
+    .reset_index(drop=True)
+)
+
+print(f"Canonical groups with zero annotations across all assemblies: {len(zero_canon)}")
+print(zero_canon.groupby("order").size().sort_values(ascending=False).to_string())
+```
+
+```{python}
+#| label: annot-zero-table
+
+zero_detail = (df[df["canonical_group"].isin(zero_canon["canonical_group"])]
+    [["canonical_group","assembly_name","asm_type","species_in_data",
+      "order","scaffold_n50","ncbi_status"]]
+    .rename(columns={
+        "canonical_group": "Canonical species",
+        "assembly_name":   "Assembly",
+        "asm_type":        "Type",
+        "species_in_data": "Species in data",
+        "order":           "Order",
+        "scaffold_n50":    "Scaffold N50",
+        "ncbi_status":     "NCBI status",
+    })
+    .sort_values(["Order","Canonical species"])
+    .reset_index(drop=True)
+)
+show_table(zero_detail,
+    caption=f"Assemblies belonging to zero-annotation canonical groups ({len(zero_canon)} species)")
+```
+
+```{python}
+#| label: annot-zero-bar
+
+_oz = (zero_canon.groupby("order").size()
+       .reset_index(name="n_zero")
+       .sort_values("n_zero", ascending=False))
+
+fig = px.bar(
+    _oz, x="order", y="n_zero",
+    color_discrete_sequence=[T10[4]],
+    labels={"order": "Taxonomic order", "n_zero": "# canonical species"},
+    title="Zero-annotation canonical species per taxonomic order",
+    template=PLOTLY_TPL,
+)
+fig.update_xaxes(tickangle=-45)
+fig.update_layout(height=430)
+show_fig(fig, height=430)
+```
+
+```{python}
+#| label: annot-zero-phylo
+
+try:
+    if not PHYLO_NWK:
+        raise ValueError("PHYLO_NWK not set")
+
+    from Bio import Phylo as _Phylo
+    import io as _io
+
+    _nwk2  = open(PHYLO_NWK).read()
+    _tree2 = next(_Phylo.parse(_io.StringIO(_nwk2), "newick"))
+
+    _asm2canon2 = dedup.set_index("assembly_name")["canonical_group"].to_dict()
+    _sp2canon2  = {c.replace(" ", "_"): c for c in dedup["canonical_group"].unique()}
+    _zero_set   = set(zero_canon["canonical_group"])
+
+    def _resolve2(t):
+        return _asm2canon2.get(t) or _sp2canon2.get(t)
+
+    _tips2 = [c.name for c in _tree2.get_terminals()]
+    _tip_df2 = pd.DataFrame({
+        "assembly":        _tips2,
+        "canonical_group": [_resolve2(t) for t in _tips2],
+        "phylo_order":     range(len(_tips2)),
+    })
+    _tip_df2["is_zero"] = _tip_df2["canonical_group"].isin(_zero_set)
+    _canon2order2 = (df[["canonical_group","order"]].drop_duplicates()
+                     .set_index("canonical_group")["order"].to_dict())
+    _tip_df2["order"] = _tip_df2["canonical_group"].map(_canon2order2)
+
+    _zero_in_tree = _tip_df2[_tip_df2["is_zero"]].copy()
+    print(f"Zero-annotation assemblies found in tree: {len(_zero_in_tree)}")
+    print(f"Canonical groups represented:             {_zero_in_tree['canonical_group'].nunique()}")
+
+    _oz_order = (_zero_in_tree.groupby("order").size()
+                 .reset_index(name="n")
+                 .sort_values("n", ascending=False))
+
+    fig2 = px.bar(
+        _oz_order, x="order", y="n",
+        color_discrete_sequence=[T10[6]],
+        labels={"order": "Taxonomic order", "n": "# assemblies in tree"},
+        title="Zero-annotation assemblies in the species tree, by order",
+        template=PLOTLY_TPL,
+    )
+    fig2.update_xaxes(tickangle=-45)
+    fig2.update_layout(height=430)
+    show_fig(fig2, height=430)
+
+    show_table(
+        _zero_in_tree[["assembly","canonical_group","order","phylo_order"]]
+        .sort_values("phylo_order")
+        .rename(columns={
+            "assembly":        "Assembly (tree tip)",
+            "canonical_group": "Canonical species",
+            "order":           "Order",
+            "phylo_order":     "Phylo index",
+        }),
+        caption="Zero-annotation assemblies present in the species tree (phylogenetic order)"
+    )
+
+except Exception as _e:
+    print(f"[phylo] Skipped: {_e}")
+```
+
+---
+
+# 5. Annotation Retention Across Pipeline Stages {.tabset}
+
+## Build stage indexes
+
+```{python}
+#| label: stage-index-build
+
+def _build_stage_index(dirpath: str, cache_name: str, label: str) -> dict:
+    _cache = os.path.join(CACHE_DIR, cache_name)
+    if os.path.exists(_cache):
+        print(f"[cache] Loading {label} index …")
+        with open(_cache, "rb") as _f:
+            return pickle.load(_f)
+    _files = sorted(Path(dirpath).glob(f"*{FASTA_EXT}"))
+    print(f"Building {label} index from {len(_files):,} files …")
+    _t = datetime.now()
+    _res = Parallel(n_jobs=N_JOBS, backend="threading", verbose=0)(
+        delayed(_assemblies_in_file)(str(fp)) for fp in _files
+    )
+    _idx: dict[str, set[str]] = defaultdict(set)
+    for gene, asms in _res:
+        for asm in asms:
+            _idx[asm].add(gene)
+    _idx = dict(_idx)
+    print(f"  done in {(datetime.now()-_t).seconds}s  |  {len(_idx):,} assemblies")
+    with open(_cache, "wb") as _f:
+        pickle.dump(_idx, _f, protocol=pickle.HIGHEST_PROTOCOL)
+    return _idx
+
+dedup_index = _build_stage_index(DIR_DEDUP, "annot_stage_dedup.pkl", "dedup")
+chi2_index  = _build_stage_index(DIR_CHI2,  "annot_stage_chi2.pkl",  "chi2")
+trim_index  = _build_stage_index(DIR_TRIM,  "annot_stage_trim.pkl",  "trim")
+print("All stage indexes ready.")
+```
+
+## Species annotation comparison
+
+```{python}
+#| label: stage-comparison
+
+# For each canonical group, count the union of annotated genes across its assemblies
+_canon_asms = df.groupby("canonical_group")["assembly_name"].apply(list).to_dict()
+
+def _group_count(idx: dict, canon_asms: dict) -> dict:
+    """CDS stage: headers are assembly names, so look up by assembly name."""
+    return {
+        canon: len(set().union(*(idx.get(a, set()) for a in asms)))
+        for canon, asms in canon_asms.items()
+    }
+
+def _group_count_by_species(idx: dict, canon_list: list) -> dict:
+    """Downstream stages (DEDUP/TRIM/PREFILTER): headers are species names
+    (canonical_group with spaces replaced by underscores)."""
+    return {
+        canon: len(idx.get(canon.replace(" ", "_"), set()))
+        for canon in canon_list
+    }
+
+_c_cds   = _group_count(annot_index, _canon_asms)
+_c_dedup = _group_count_by_species(dedup_index, list(_canon_asms.keys()))
+_c_chi2  = _group_count_by_species(chi2_index,  list(_canon_asms.keys()))
+_c_trim  = _group_count_by_species(trim_index,  list(_canon_asms.keys()))
+
+stage_df = (grp[["canonical_group", "order"]]
+    .assign(
+        CDS     = lambda x: x["canonical_group"].map(_c_cds).fillna(0).astype(int),
+        Dedup   = lambda x: x["canonical_group"].map(_c_dedup).fillna(0).astype(int),
+        Chi2    = lambda x: x["canonical_group"].map(_c_chi2).fillna(0).astype(int),
+        Trimmed = lambda x: x["canonical_group"].map(_c_trim).fillna(0).astype(int),
+    )
+    .sort_values(["order", "canonical_group"])
+    .reset_index(drop=True)
+)
+
+print(f"Species: {len(stage_df)}  |  Orders: {stage_df['order'].nunique()}")
+print(stage_df[["CDS","Dedup","Chi2","Trimmed"]].describe().round(0).to_string())
+```
+
+```{python}
+#| label: stage-barplot
+
+_STAGE_COLORS = {
+    "CDS":     T10[0],
+    "Dedup":   T10[1],
+    "Chi2":    T10[2],
+    "Trimmed": T10[3],
+}
+
+_orders = stage_df["order"].unique()
+
+for _order in sorted(_orders):
+    _sub = stage_df[stage_df["order"] == _order].reset_index(drop=True)
+    _species_sub = _sub["canonical_group"].tolist()
+
+    # Dynamic width: ~14 px per species, min 600, max 1600
+    _w = max(600, min(1600, len(_species_sub) * 14 + 120))
+    _tick_size = 7 if len(_species_sub) > 40 else 9
+
+    _fig = go.Figure()
+    for stage, color in _STAGE_COLORS.items():
+        _fig.add_trace(go.Bar(
+            x=_species_sub,
+            y=_sub[stage],
+            name=stage,
+            marker_color=color,
+            opacity=0.85,
+        ))
+
+    _fig.update_layout(
+        barmode="group",
+        template=PLOTLY_TPL,
+        title_text=f"Annotated genes per pipeline stage — {_order} (n={len(_species_sub)})",
+        xaxis=dict(
+            tickangle=-55,
+            tickfont=dict(size=_tick_size),
+            title="Canonical species",
+        ),
+        yaxis_title="# annotated genes",
+        legend_title="Stage",
+        height=480,
+        width=_w,
+        margin=dict(b=140),
+    )
+    show_fig(_fig, height=480)
+```
+
+## Stage retention table
+
+```{python}
+#| label: stage-retention-table
+
+_ret = stage_df.copy()
+_ret["Dedup / CDS (%)"]    = (_ret["Dedup"]   / _ret["CDS"].replace(0, np.nan) * 100).round(1)
+_ret["Chi2 / Dedup (%)"]   = (_ret["Chi2"]    / _ret["Dedup"].replace(0, np.nan) * 100).round(1)
+_ret["Trim / Chi2 (%)"]    = (_ret["Trimmed"] / _ret["Chi2"].replace(0, np.nan) * 100).round(1)
+
+# Diagnostic: warn about species with CDS > 0 but all downstream zeros
+_missing_downstream = _ret[
+    (_ret["CDS"] > 0) &
+    (_ret["Dedup"] == 0) & (_ret["Chi2"] == 0) & (_ret["Trimmed"] == 0)
+]
+if len(_missing_downstream) > 0:
+    print(f"WARNING: {len(_missing_downstream)} species have CDS annotations but "
+          f"zero counts in all downstream stages.\n"
+          f"Check that downstream FASTA headers match canonical_group names "
+          f"(e.g. 'Canis_lupus' not 'HLcanLup8').")
+
+show_table(
+    _ret.rename(columns={"canonical_group": "Canonical species"}),
+    caption="Annotated gene counts and stage-to-stage retention per canonical species"
+)
+```
+
+---
+
+# 6. Phylogenetic Distribution of Duplicates {.tabset}
+
+## Distribution by taxonomic order
+
+```{python}
+#| label: phylo-order
+
+# grp already carries the order column from the groupby in cell 4
+order_dup = (grp.groupby("order")
+    .agg(
+        n_canonical_groups= ("canonical_group","count"),
+        n_replicate_groups= ("n_replicates",   lambda x: (x > 0).sum()),
+        n_subspecies_groups=("n_subspecies",   lambda x: (x > 0).sum()),
+        total_assemblies  = ("n_total",         "sum"),
+    )
+    .sort_values("n_canonical_groups", ascending=False)
+    .reset_index()
+)
+
+fig = go.Figure()
+for col, color, label in [
+    ("n_replicate_groups",  T10[0], "Groups with replicates"),
+    ("n_subspecies_groups", T10[1], "Groups with subspecies"),
+]:
+    fig.add_trace(go.Bar(
+        x=order_dup["order"],
+        y=order_dup[col],
+        name=label,
+        marker_color=color,
+    ))
+
+fig.update_layout(
+    barmode="group",
+    template=PLOTLY_TPL,
+    title_text="Duplicate assembly types per taxonomic order",
+    xaxis_tickangle=-45,
+    yaxis_title="# canonical species",
+    legend_title="",
+    height=520,
+)
+show_fig(fig, height=520)
+```
+
+## Phylogeny-aware heatmap
+
+Tree tips are assembly names (e.g. `HLcanLup8`). Each tip is mapped to its
+canonical group via the dedup table, then labelled by duplicate category.
+Species with multiple assemblies in the tree are highlighted.
+
+```{python}
+#| label: phylo-tree
+
+try:
+    if not PHYLO_NWK:
+        raise ValueError("PHYLO_NWK not set")
+
+    from Bio import Phylo as _Phylo
+    import io as _io
+
+    _nwk  = open(PHYLO_NWK).read()
+    _tree = next(_Phylo.parse(_io.StringIO(_nwk), "newick"))
+
+    # assembly_name → canonical_group lookup from dedup table (try both formats)
+    _asm2canon = dedup.set_index("assembly_name")["canonical_group"].to_dict()
+    _sp2canon  = {c.replace(" ", "_"): c for c in dedup["canonical_group"].unique()}
+
+    def _resolve(t):
+        return _asm2canon.get(t) or _sp2canon.get(t)
+
+    # canonical_group → dup category
+    _rep_set = set(grp.loc[grp.n_replicates > 0, "canonical_group"])
+    _sub_set = set(grp.loc[grp.n_subspecies > 0, "canonical_group"])
+
+    def _dup_cat(tip):
+        canon = _resolve(tip)
+        if canon is None:           return "singleton"
+        if canon in _rep_set and canon in _sub_set: return "both"
+        if canon in _rep_set:       return "replicate"
+        if canon in _sub_set:       return "subspecies"
+        return "singleton"
+
+    _tips = [c.name for c in _tree.get_terminals()]
+    _tip_df = pd.DataFrame({
+        "assembly":       _tips,
+        "canonical_group": [_resolve(t) for t in _tips],
+        "category":        [_dup_cat(t) for t in _tips],
+        "phylo_order":     range(len(_tips)),
+    })
+
+    # Attach n_total / n_replicates / n_subspecies / order
+    _tip_df = _tip_df.merge(
+        grp[["canonical_group","n_total","n_replicates","n_subspecies","order"]],
+        on="canonical_group", how="left",
+    )
+    # For singletons (not in dedup), fill zeros so the table is complete
+    for _c in ["n_total","n_replicates","n_subspecies"]:
+        _tip_df[_c] = _tip_df[_c].fillna(1 if _c == "n_total" else 0).astype(int)
+
+    # ── Bar: category counts ───────────────────────────────────────────────────
+    _pal = {"singleton": "#d3d3d3", "replicate": T10[0],
+            "subspecies": T10[1],   "both": T10[3]}
+    _cat_counts = (_tip_df["category"].value_counts()
+                   .reset_index().rename(columns={"index":"category","count":"n"}))
+
+    fig_bar = px.bar(
+        _cat_counts, x="category", y="n",
+        color="category", color_discrete_map=_pal,
+        labels={"category": "Duplicate type", "n": "# assemblies in tree"},
+        title="Duplicate assembly type across phylogeny tips",
+        template=PLOTLY_TPL,
+    )
+    show_fig(fig_bar, height=400)
+
+    # ── Ordered table (phylogenetic order, duplicates only) ────────────────────
+    show_table(
+        _tip_df[_tip_df["category"] != "singleton"]
+        .sort_values("phylo_order")
+        [["assembly","canonical_group","category","order",
+          "n_total","n_replicates","n_subspecies"]]
+        .rename(columns={
+            "assembly":        "Assembly (tree tip)",
+            "canonical_group": "Canonical species",
+            "category":        "Dup type",
+            "order":           "Order",
+            "n_total":         "Total assemblies",
+            "n_replicates":    "Replicates",
+            "n_subspecies":    "Subspecies",
+        }),
+        caption="Duplicate assemblies in the species tree (phylogenetic order)"
+    )
+
+    # ── How many canonical groups have ≥2 tips in the tree? ───────────────────
+    _tips_per_canon = (_tip_df.groupby("canonical_group")["assembly"]
+                       .count().reset_index()
+                       .rename(columns={"assembly":"n_tips_in_tree"}))
+    _multi = _tips_per_canon[_tips_per_canon.n_tips_in_tree > 1].shape[0]
+    print(f"Canonical groups with ≥2 tips in tree: {_multi}")
+    print(f"Total tree tips: {len(_tips)}  |  mapped to dedup: {_tip_df['canonical_group'].notna().sum()}")
+
+except Exception as _e:
+    print(f"[phylo] Tree visualisation skipped: {_e}")
+    print("Proceeding with order-level summary only.")
+```
+
+## Scatter: N50 quality vs annotation coverage
+
+```{python}
+#| label: quality-scatter
+
+_plot = df.dropna(subset=["scaffold_n50"]).copy()
+_plot["scaffold_n50"]  = _plot["scaffold_n50"].astype(float)
+_plot["n_annotations"] = _plot["n_annotations"].astype(float)
+
+fig = px.scatter(
+    _plot,
+    x="scaffold_n50",
+    y="n_annotations",
+    color="asm_type",
+    symbol="ncbi_status",
+    hover_name="assembly_name",
+    hover_data={"canonical_group": True, "asm_type": False, "ncbi_status": True},
+    log_x=True,
+    color_discrete_map={"replicate": T10[0], "subspecies": T10[1]},
+    labels={
+        "scaffold_n50":  "Scaffold N50 (log bp)",
+        "n_annotations": "# annotated genes",
+        "asm_type":      "Type",
+        "ncbi_status":   "NCBI status",
+    },
+    title="Assembly quality vs annotation coverage",
+    template=PLOTLY_TPL,
+)
+fig.update_traces(marker_size=5, marker_opacity=0.7)
+show_fig(fig, height=520)
+```
+
+---
+
+# 7. Full Assembly Table {.tabset}
+
+## Complete per-assembly view
+
+```{python}
+#| label: full-table
+
+full_tbl = (df[["canonical_group","assembly_name","asm_type","species_in_data",
+                 "ncbi_status","scaffold_n50","contig_n50","intact_orf","n_annotations"]]
+    .rename(columns={
+        "canonical_group": "Canonical species",
+        "assembly_name":   "Assembly",
+        "asm_type":        "Type",
+        "species_in_data": "Species in data",
+        "ncbi_status":     "NCBI status",
+        "scaffold_n50":    "Scaffold N50",
+        "contig_n50":      "Contig N50",
+        "intact_orf":      "Intact ORFs",
+        "n_annotations":   "Annotated genes",
+    })
+    .sort_values(["Canonical species","Assembly"])
+    .reset_index(drop=True)
+)
+show_table(full_tbl, caption="All assemblies belonging to multi-assembly canonical species")
+```

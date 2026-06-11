@@ -1,0 +1,357 @@
+---
+title: "Positive Selection Report"
+date: today
+format:
+  html:
+    toc: true
+    toc-float: true
+    toc-depth: 3
+    theme: flatly
+    code-fold: true
+    embed-resources: true
+    fig-width: 11
+    fig-height: 6
+jupyter: python3
+execute:
+  dir: file
+---
+
+```{=html}
+<style>
+.cell-output-display { margin-top: 2em; }
+h2, h3 { margin-top: 1.8em; }
+</style>
+```
+
+```{python}
+#| label: setup
+#| echo: false
+
+import os, json, warnings
+from pathlib import Path
+
+import numpy  as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from itables import show as ishow
+import itables.options as ito
+
+warnings.filterwarnings("ignore")
+
+FUBAR_TSV            = os.environ.get("FUBAR_TSV",            "fubar_results.tsv")
+FUBAR_SITES_TSV      = os.environ.get("FUBAR_SITES_TSV",      "")
+FEL_TSV              = os.environ.get("FEL_TSV",              "fel_results.tsv")
+MEME_TSV             = os.environ.get("MEME_TSV",             "")
+GENE_VARIABILITY_TSV = os.environ.get("GENE_VARIABILITY_TSV", "")
+TAXID_TSV            = os.environ.get("TAXID_TSV",            "")
+FAMILY_ORDER_TSV     = os.environ.get("FAMILY_ORDER_TSV",     "")
+SPECIES_TREE         = os.environ.get("SPECIES_TREE",         "")
+HYPHY_METHODS        = os.environ.get("HYPHY_METHODS",        "FUBAR,FEL")
+FUBAR_THRESHOLD      = float(os.environ.get("FUBAR_THRESHOLD", "0.9"))
+
+T10 = px.colors.qualitative.T10
+TPL = "plotly_white"
+
+ito.maxBytes   = 0
+ito.maxRows    = 500
+ito.classes    = "display compact"
+ito.paging     = True
+ito.pageLength = 20
+ito.scrollX    = True
+
+def show_fig(fig, height=None):
+    kw = {"height": height} if height else {}
+    fig.update_layout(template=TPL, margin=dict(t=60, b=40), **kw)
+    fig.show()
+
+def safe_read(path, **kwargs):
+    if path and Path(path).exists() and "NO_" not in str(path):
+        return pd.read_csv(path, sep='\t', **kwargs)
+    return pd.DataFrame()
+```
+
+```{python}
+#| label: load-data
+#| echo: false
+
+fubar_df    = safe_read(FUBAR_TSV)
+fubar_sites = safe_read(FUBAR_SITES_TSV)
+fel_df      = safe_read(FEL_TSV)
+meme_df     = safe_read(MEME_TSV)
+var_df      = safe_read(GENE_VARIABILITY_TSV)
+
+has_meme     = not meme_df.empty
+has_var      = not var_df.empty
+has_fubar_sites = not fubar_sites.empty
+
+# Build variability × selection join
+sel_var_df = pd.DataFrame()
+if has_var and not fubar_df.empty:
+    gene_col_fubar = next((c for c in fubar_df.columns if 'gene' in c.lower()), fubar_df.columns[0])
+    gene_col_var   = next((c for c in var_df.columns   if 'gene' in c.lower()), var_df.columns[0])
+    sel_var_df = fubar_df.merge(var_df, left_on=gene_col_fubar, right_on=gene_col_var, how='inner')
+
+print(f"FUBAR: {len(fubar_df)} genes | FEL: {len(fel_df)} sites | "
+      f"MEME: {len(meme_df)} genes | variability join: {len(sel_var_df)} genes | methods: {HYPHY_METHODS}")
+```
+
+## Overview
+
+```{python}
+#| label: overview
+#| echo: false
+
+from IPython.display import Markdown, display
+
+n_genes_fubar   = len(fubar_df)
+pos_col_fubar   = next((c for c in fubar_df.columns
+                        if 'n_pos' in c.lower()
+                        or 'pos_sites' in c.lower()), None)
+neg_col_fubar   = next((c for c in fubar_df.columns
+                        if 'n_neg' in c.lower()
+                        or 'neg_sites' in c.lower()), None)
+n_pos_genes     = int((fubar_df[pos_col_fubar] > 0).sum()) if pos_col_fubar else "N/A"
+n_neg_genes     = int((fubar_df[neg_col_fubar] > 0).sum()) if neg_col_fubar else "N/A"
+pct_pos         = f"{100 * n_pos_genes / max(n_genes_fubar, 1):.1f}%" if isinstance(n_pos_genes, int) else "N/A"
+pct_neg         = f"{100 * n_neg_genes / max(n_genes_fubar, 1):.1f}%" if isinstance(n_neg_genes, int) else "N/A"
+
+display(Markdown(f"""
+| Metric | Value |
+|--------|-------|
+| Genes tested | **{n_genes_fubar}** |
+| Methods | **{HYPHY_METHODS}** |
+| FUBAR threshold (PP) | **{FUBAR_THRESHOLD}** |
+| Genes with **positive** selection sites (FUBAR) | **{n_pos_genes}** ({pct_pos}) |
+| Genes with **purifying** selection sites (FUBAR) | **{n_neg_genes}** ({pct_neg}) |
+| MEME run (episodic positive selection) | **{'yes' if has_meme else 'no'}** |
+
+> **FUBAR** tests each site for *pervasive* selection across all branches: PP(α<β) ≥ {FUBAR_THRESHOLD} → positive; PP(α>β) ≥ {FUBAR_THRESHOLD} → purifying.
+> **MEME** tests each site for *episodic* positive selection on a subset of branches (LRT p ≤ 0.05), run only on genes with ≥1 FUBAR-positive site.
+"""))
+```
+
+## FUBAR results
+
+```{python}
+#| label: fubar-hist
+#| echo: false
+
+if not fubar_df.empty:
+    gene_col = next((c for c in fubar_df.columns if 'gene' in c.lower()), fubar_df.columns[0])
+
+    # ── Positive selection ────────────────────────────────────────────────────
+    if pos_col_fubar:
+        pos_genes = fubar_df[fubar_df[pos_col_fubar] > 0]
+
+        fig = px.histogram(fubar_df, x=pos_col_fubar, nbins=40,
+                           title=f'FUBAR: positive selection — sites per gene (PP ≥ {FUBAR_THRESHOLD})',
+                           labels={pos_col_fubar: 'Sites with PP(α<β) ≥ threshold'},
+                           color_discrete_sequence=[T10[3]])
+        fig.update_layout(bargap=0.05)
+        show_fig(fig)
+
+        top_fubar = pos_genes.sort_values(pos_col_fubar, ascending=False).head(40)
+        if not top_fubar.empty:
+            fig2 = px.bar(top_fubar, x=pos_col_fubar, y=gene_col,
+                          orientation='h',
+                          title=f'Top genes by FUBAR-positive sites (PP ≥ {FUBAR_THRESHOLD})',
+                          labels={pos_col_fubar: 'Positive sites', gene_col: 'Gene'},
+                          color=pos_col_fubar, color_continuous_scale='YlOrRd')
+            fig2.update_layout(yaxis={'categoryorder': 'total ascending'}, height=max(400, len(top_fubar) * 22))
+            show_fig(fig2)
+
+        ishow(pos_genes.sort_values(pos_col_fubar, ascending=False).reset_index(drop=True),
+              caption="All genes with FUBAR positive selection sites")
+
+    # ── Purifying selection ───────────────────────────────────────────────────
+    if neg_col_fubar:
+        neg_genes = fubar_df[fubar_df[neg_col_fubar] > 0]
+
+        fig3 = px.histogram(fubar_df, x=neg_col_fubar, nbins=40,
+                            title=f'FUBAR: purifying selection — sites per gene (PP ≥ {FUBAR_THRESHOLD})',
+                            labels={neg_col_fubar: 'Sites with PP(α>β) ≥ threshold'},
+                            color_discrete_sequence=[T10[0]])
+        fig3.update_layout(bargap=0.05)
+        show_fig(fig3)
+
+        top_neg = neg_genes.sort_values(neg_col_fubar, ascending=False).head(40)
+        if not top_neg.empty:
+            fig4 = px.bar(top_neg, x=neg_col_fubar, y=gene_col,
+                          orientation='h',
+                          title=f'Top genes by FUBAR-purifying sites (PP ≥ {FUBAR_THRESHOLD})',
+                          labels={neg_col_fubar: 'Purifying sites', gene_col: 'Gene'},
+                          color=neg_col_fubar, color_continuous_scale='Blues')
+            fig4.update_layout(yaxis={'categoryorder': 'total ascending'}, height=max(400, len(top_neg) * 22))
+            show_fig(fig4)
+
+    # ── Scatter: positive vs purifying per gene ───────────────────────────────
+    if pos_col_fubar and neg_col_fubar:
+        fubar_df['selection_class'] = 'neutral'
+        fubar_df.loc[fubar_df[pos_col_fubar] > 0, 'selection_class'] = 'positive'
+        fubar_df.loc[fubar_df[neg_col_fubar] > 0, 'selection_class'] = 'purifying'
+        fubar_df.loc[(fubar_df[pos_col_fubar] > 0) & (fubar_df[neg_col_fubar] > 0), 'selection_class'] = 'both'
+        fig5 = px.scatter(fubar_df, x=neg_col_fubar, y=pos_col_fubar,
+                          color='selection_class',
+                          hover_name=gene_col,
+                          color_discrete_map={'positive': T10[3], 'purifying': T10[0],
+                                              'both': T10[2], 'neutral': 'lightgrey'},
+                          title='FUBAR: positive vs purifying selection sites per gene',
+                          labels={neg_col_fubar: 'Purifying sites (PP(α>β) ≥ threshold)',
+                                  pos_col_fubar: 'Positive sites (PP(α<β) ≥ threshold)'},
+                          opacity=0.7)
+        fig5.update_traces(marker_size=7)
+        show_fig(fig5)
+```
+
+## FUBAR site-level results
+
+```{python}
+#| label: fubar-sites
+#| echo: false
+
+if has_fubar_sites:
+    pos_site_col = next((c for c in fubar_sites.columns if 'is_pos' in c.lower() or 'hit' in c.lower()), None)
+    prob_col     = next((c for c in fubar_sites.columns if 'prob' in c.lower()), None)
+    g_col        = next((c for c in fubar_sites.columns if 'gene' in c.lower()), fubar_sites.columns[0])
+
+    if pos_site_col:
+        hits = fubar_sites[fubar_sites[pos_site_col] == 1].copy()
+        display(Markdown(f"**{len(hits):,} positively selected sites** across **{hits[g_col].nunique()} genes**"))
+
+        if prob_col:
+            fig = px.histogram(hits, x=prob_col, nbins=50,
+                               title='FUBAR positive sites: posterior probability distribution',
+                               labels={prob_col: 'Posterior probability (positive selection)'},
+                               color_discrete_sequence=[T10[3]])
+            show_fig(fig)
+
+        ishow(hits.sort_values(prob_col, ascending=False).head(500).reset_index(drop=True) if prob_col else hits.head(500),
+              caption="Top positively selected sites (up to 500)")
+    else:
+        ishow(fubar_sites.head(200).reset_index(drop=True), caption="FUBAR sites")
+else:
+    display(Markdown("*FUBAR site-level data (fubar_sites.tsv) not available.*"))
+```
+
+## FEL results
+
+```{python}
+#| label: fel-volcano
+#| echo: false
+
+if not fel_df.empty:
+    pval_col = next((c for c in fel_df.columns if 'p_val' in c.lower() or 'pvalue' in c.lower()), None)
+    dn_col   = next((c for c in fel_df.columns if 'dn' in c.lower() or 'dN' in c), None)
+    ds_col   = next((c for c in fel_df.columns if 'ds' in c.lower() or 'dS' in c), None)
+
+    if pval_col and dn_col and ds_col:
+        fel_df['log10p']   = -np.log10(fel_df[pval_col].replace(0, 1e-300))
+        fel_df['dnds']     = fel_df[dn_col] / fel_df[ds_col].replace(0, np.nan)
+        fel_df['selected'] = (fel_df[pval_col] < 0.05) & (fel_df['dnds'] > 1)
+
+        fig = px.scatter(fel_df, x='dnds', y='log10p',
+                         color='selected',
+                         color_discrete_map={True: T10[3], False: 'lightgrey'},
+                         title='FEL: dN/dS vs significance (−log₁₀ p)',
+                         labels={'dnds': 'dN/dS', 'log10p': '−log₁₀(p)', 'selected': 'Selected'},
+                         opacity=0.6)
+        fig.add_vline(x=1, line_dash='dash', line_color='grey')
+        fig.add_hline(y=-np.log10(0.05), line_dash='dash', line_color='grey')
+        show_fig(fig)
+
+    ishow(fel_df.sort_values(pval_col).head(100).reset_index(drop=True) if pval_col else fel_df.head(100),
+          caption="FEL: top sites by significance")
+```
+
+## MEME results
+
+```{python}
+#| label: meme
+#| echo: false
+
+if has_meme:
+    pval_col_meme = next((c for c in meme_df.columns if 'p_meme' in c.lower() or 'p-value' in c.lower()), None)
+    gene_col_meme = next((c for c in meme_df.columns if 'gene' in c.lower()), meme_df.columns[0])
+
+    sig = meme_df[meme_df[pval_col_meme] <= 0.05] if pval_col_meme else pd.DataFrame()
+    n_sig_sites = len(sig)
+    n_sig_genes = sig[gene_col_meme].nunique() if not sig.empty else 0
+
+    display(Markdown(f"""
+| Metric | Value |
+|--------|-------|
+| Sites tested by MEME | **{len(meme_df):,}** |
+| Sites with p ≤ 0.05 (episodic positive selection) | **{n_sig_sites:,}** |
+| Genes with ≥1 MEME-significant site | **{n_sig_genes}** |
+
+> **MEME** detects *episodic* positive selection: sites where a subset of branches experienced dN > dS (LRT p ≤ 0.05).
+"""))
+
+    if pval_col_meme:
+        fig = px.histogram(meme_df, x=pval_col_meme, nbins=50,
+                           title='MEME: distribution of site-level p-values',
+                           labels={pval_col_meme: 'p-value (LRT)'},
+                           color_discrete_sequence=[T10[1]])
+        fig.add_vline(x=0.05, line_dash='dash', line_color='red',
+                      annotation_text='p=0.05', annotation_position='top right')
+        fig.update_layout(bargap=0.05)
+        show_fig(fig)
+
+    # Genes ranked by number of MEME-significant sites
+    if pval_col_meme and not sig.empty:
+        gene_counts = sig.groupby(gene_col_meme).size().reset_index(name='n_meme_sig_sites')
+        gene_counts = gene_counts.sort_values('n_meme_sig_sites', ascending=False)
+        top_meme = gene_counts.head(40)
+        fig2 = px.bar(top_meme, x='n_meme_sig_sites', y=gene_col_meme,
+                      orientation='h',
+                      title='Top genes by MEME-significant sites (p ≤ 0.05)',
+                      labels={'n_meme_sig_sites': 'Sites with episodic positive selection',
+                              gene_col_meme: 'Gene'},
+                      color='n_meme_sig_sites', color_continuous_scale='Oranges')
+        fig2.update_layout(yaxis={'categoryorder': 'total ascending'},
+                           height=max(400, len(top_meme) * 22))
+        show_fig(fig2)
+
+    ishow(meme_df.sort_values(pval_col_meme).head(500).reset_index(drop=True) if pval_col_meme
+          else meme_df.head(500).reset_index(drop=True),
+          caption="MEME sites (sorted by p-value, up to 500 rows)")
+else:
+    display(Markdown("*MEME was not run (no genes exceeded the FUBAR site threshold), or results not provided.*"))
+```
+
+## Variability vs positive selection
+
+```{python}
+#| label: var-vs-sel
+#| echo: false
+
+if not sel_var_df.empty:
+    var_col  = next((c for c in sel_var_df.columns if c == 'mean_variability'), None) \
+               or next((c for c in sel_var_df.columns if 'variability' in c.lower()), None)
+    pos_col2 = pos_col_fubar   # already identified in overview block
+    gene_col = next((c for c in sel_var_df.columns if 'gene' in c.lower()), sel_var_df.columns[0])
+
+    if var_col and pos_col2 and pos_col2 in sel_var_df.columns:
+        sel_var_df['has_signal'] = sel_var_df[pos_col2] > 0
+
+        fig = px.scatter(sel_var_df, x=var_col, y=pos_col2,
+                         hover_name=gene_col,
+                         color='has_signal',
+                         color_discrete_map={True: T10[3], False: 'lightgrey'},
+                         title='Mean Valdar variability vs FUBAR-positive sites per gene',
+                         labels={var_col: 'Mean variability (Valdar)', pos_col2: 'FUBAR positive sites',
+                                 'has_signal': 'Positive selection'},
+                         opacity=0.8)
+        fig.update_traces(marker_size=8)
+        show_fig(fig)
+
+        # Correlation summary
+        corr = sel_var_df[[var_col, pos_col2]].corr().iloc[0, 1]
+        display(Markdown(f"**Pearson r(variability, FUBAR sites) = {corr:.3f}** (n={len(sel_var_df)} genes)"))
+else:
+    display(Markdown("*Variability × selection join not available — gene_variability.tsv was not passed.*  \n"
+                     "Run the variability workflow first, or pass `--variability_tsv`.*"))
+```
+

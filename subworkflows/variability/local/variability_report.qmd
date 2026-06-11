@@ -1,0 +1,990 @@
+---
+title: "Alignment Variability Report"
+date: today
+format:
+  html:
+    toc: true
+    toc-float: true
+    toc-depth: 3
+    theme: flatly
+    code-fold: true
+    embed-resources: true
+    fig-width: 11
+    fig-height: 6
+jupyter: python3
+execute:
+  dir: file
+---
+
+```{=html}
+<style>
+.cell-output-display { margin-top: 2em; }
+h2, h3 { margin-top: 1.8em; }
+</style>
+```
+
+```{python}
+#| label: setup
+#| echo: false
+
+import os, warnings
+from pathlib import Path
+
+import numpy  as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from itables import show as ishow
+import itables.options as ito
+
+warnings.filterwarnings("ignore")
+
+GENE_VARIABILITY_TSV  = os.environ.get("GENE_VARIABILITY_TSV",  "gene_variability.tsv")
+CLADE_VARIABILITY_TSV = os.environ.get("CLADE_VARIABILITY_TSV", "")
+CLADE_OUTLIERS_TSV    = os.environ.get("CLADE_OUTLIERS_TSV",    "")
+ENTROPY_DIR           = os.environ.get("ENTROPY_DIR",           ".")
+DOMAIN_TSV            = os.environ.get("DOMAIN_TSV",            "")
+PFAM_DESC_TSV         = os.environ.get("PFAM_DESC_TSV",         "")
+TAXID_TSV             = os.environ.get("TAXID_TSV",             "")
+FAMILY_ORDER_TSV      = os.environ.get("FAMILY_ORDER_TSV",      "")
+SPECIES_TREE          = os.environ.get("SPECIES_TREE",          "")
+SEL_VARIABILITY_TSV   = os.environ.get("SEL_VARIABILITY_TSV",   "")
+UCR_WINDOWS_TSV       = os.environ.get("UCR_WINDOWS_TSV",       "")
+UCR_POSITIONS_TSV     = os.environ.get("UCR_POSITIONS_TSV",     "")
+
+T10 = px.colors.qualitative.T10
+TPL = "plotly_white"
+
+ito.maxBytes  = 0
+ito.maxRows   = 500
+ito.classes   = "display compact"
+ito.paging    = True
+ito.pageLength= 20
+ito.scrollX   = True
+
+def show_fig(fig, height=None):
+    kw = {"height": height} if height else {}
+    fig.update_layout(template=TPL, margin=dict(t=60, b=40), **kw)
+    fig.show()
+```
+
+```{python}
+#| label: load-data
+#| echo: false
+
+def _safe(path, no_sentinel="NO_"):
+    return path and Path(path).exists() and Path(path).stat().st_size > 0 and no_sentinel not in str(path)
+
+var_df = pd.read_csv(GENE_VARIABILITY_TSV, sep='\t') if Path(GENE_VARIABILITY_TSV).exists() else pd.DataFrame()
+
+clade_var_df = pd.read_csv(CLADE_VARIABILITY_TSV, sep='\t') if _safe(CLADE_VARIABILITY_TSV) else pd.DataFrame()
+clade_out_df = pd.read_csv(CLADE_OUTLIERS_TSV,    sep='\t') if _safe(CLADE_OUTLIERS_TSV)    else pd.DataFrame()
+
+domain_df = pd.read_csv(DOMAIN_TSV, sep='\t') if _safe(DOMAIN_TSV, "NO_DOMAIN") else pd.DataFrame()
+
+pfam_desc_df = pd.DataFrame()
+if _safe(PFAM_DESC_TSV):
+    pfam_desc_df = pd.read_csv(PFAM_DESC_TSV, sep='\t')
+    if 'pfam_id' not in pfam_desc_df.columns:
+        pfam_desc_df.columns = ['pfam_id', 'pfam_description']
+
+taxid_df = pd.DataFrame()
+if _safe(TAXID_TSV):
+    taxid_df = pd.read_csv(TAXID_TSV, sep='\t')
+
+fam_order_df = pd.DataFrame()
+if _safe(FAMILY_ORDER_TSV):
+    fam_order_df = pd.read_csv(FAMILY_ORDER_TSV, sep='\t')
+
+sel_var_df = pd.DataFrame()
+if _safe(SEL_VARIABILITY_TSV):
+    sel_var_df = pd.read_csv(SEL_VARIABILITY_TSV, sep='\t')
+
+ucr_win_df = pd.DataFrame()
+if _safe(UCR_WINDOWS_TSV):
+    ucr_win_df = pd.read_csv(UCR_WINDOWS_TSV, sep='\t')
+
+ucr_pos_df = pd.DataFrame()
+if _safe(UCR_POSITIONS_TSV):
+    ucr_pos_df = pd.read_csv(UCR_POSITIONS_TSV, sep='\t')
+
+print(f"Loaded {len(var_df)} genes, {len(clade_var_df)} clade rows, {len(domain_df)} domain rows, "
+      f"{len(sel_var_df)} sel-var rows, {len(ucr_win_df)} UCR windows, {len(ucr_pos_df)} UCR positions")
+```
+
+## Overview
+
+```{python}
+#| label: overview
+#| echo: false
+
+from IPython.display import Markdown, display
+
+n_genes = len(var_df)
+mean_var = round(var_df['mean_variability'].mean(), 4) if 'mean_variability' in var_df.columns else "N/A"
+has_domains = not domain_df.empty
+
+display(Markdown(f"""
+| Metric | Value |
+|--------|-------|
+| Genes analysed | **{n_genes}** |
+| Mean variability (all genes) | **{mean_var}** |
+| Pfam domain data | **{'yes' if has_domains else 'no'}** |
+"""))
+```
+
+## Mean variability distribution
+
+```{python}
+#| label: var-dist
+#| echo: false
+
+if 'mean_variability' in var_df.columns:
+    fig = px.histogram(var_df, x='mean_variability', nbins=60,
+                       title='Distribution of mean Valdar variability per gene',
+                       labels={'mean_variability': 'Mean variability'},
+                       color_discrete_sequence=[T10[0]])
+    fig.update_layout(bargap=0.04)
+    show_fig(fig)
+```
+
+## Most and least variable genes
+
+```{python}
+#| label: top-bottom
+#| echo: false
+
+if 'mean_variability' in var_df.columns:
+    gene_col = next((c for c in var_df.columns if 'gene' in c.lower()), var_df.columns[0])
+    top20 = var_df.nlargest(20, 'mean_variability')[[gene_col, 'mean_variability']].reset_index(drop=True)
+    bot20 = var_df.nsmallest(20, 'mean_variability')[[gene_col, 'mean_variability']].reset_index(drop=True)
+
+    fig = make_subplots(rows=1, cols=2,
+                        subplot_titles=['20 most variable genes', '20 most conserved genes'])
+    fig.add_trace(go.Bar(y=top20[gene_col], x=top20['mean_variability'],
+                         orientation='h', marker_color=T10[3], name='variable'), row=1, col=1)
+    fig.add_trace(go.Bar(y=bot20[gene_col], x=bot20['mean_variability'],
+                         orientation='h', marker_color=T10[0], name='conserved'), row=1, col=2)
+    fig.update_layout(showlegend=False, height=550)
+    show_fig(fig)
+
+    ishow(var_df.sort_values('mean_variability', ascending=False).reset_index(drop=True),
+          caption="All genes sorted by mean variability")
+```
+
+## Clade-level variability
+
+```{python}
+#| label: clade-order
+#| echo: false
+
+def _clade_plot(df, level, title_suffix, n_top_genes=40):
+    """Bar + box plot: mean variability per clade, faceted or single panel."""
+    sub = df[df['clade_level'] == level].copy()
+    if sub.empty:
+        display(Markdown(f"*No {level}-level data in clade_variability.tsv.*"))
+        return
+
+    # Per-clade mean across all genes (rank axis)
+    clade_mean = sub.groupby('clade_name')['mean_variability'].mean().sort_values(ascending=True)
+    clade_order = clade_mean.index.tolist()
+
+    # Box plot: distribution of per-gene mean variability within each clade
+    fig = px.box(
+        sub,
+        x='mean_variability',
+        y='clade_name',
+        category_orders={'clade_name': clade_order},
+        title=f'Mean Valdar variability by {level} ({title_suffix})',
+        labels={'mean_variability': 'Mean variability', 'clade_name': level.capitalize()},
+        color='clade_name',
+        color_discrete_sequence=px.colors.qualitative.Pastel,
+    )
+    fig.update_layout(showlegend=False, height=max(500, len(clade_order) * 28))
+    show_fig(fig)
+
+    # Heatmap of top-variable genes × clades
+    gene_col = next((c for c in var_df.columns if 'gene' in c.lower()), 'gene') if not var_df.empty else 'gene'
+    top_genes = (
+        var_df.nlargest(n_top_genes, 'mean_variability')[gene_col].tolist()
+        if 'mean_variability' in var_df.columns else sub['gene'].unique()[:n_top_genes].tolist()
+    )
+    pivot = (
+        sub[sub['gene'].isin(top_genes)]
+        .pivot_table(index='clade_name', columns='gene', values='mean_variability', aggfunc='mean')
+        .reindex(index=clade_order)
+    )
+    if not pivot.empty:
+        fig2 = px.imshow(
+            pivot,
+            color_continuous_scale='RdYlBu_r',
+            title=f'Clade × gene heatmap — {level} level (top {n_top_genes} variable genes)',
+            labels=dict(color='Mean variability'),
+            aspect='auto',
+        )
+        show_fig(fig2, height=max(350, len(clade_order) * 22))
+
+if not clade_var_df.empty:
+    _clade_plot(clade_var_df, 'order', 'all genes')
+else:
+    display(Markdown("*Clade variability data not available — CLADE_VARIABILITY_TSV not staged.*"))
+```
+
+```{python}
+#| label: clade-family
+#| echo: false
+
+if not clade_var_df.empty:
+    _clade_plot(clade_var_df, 'family', 'all genes', n_top_genes=40)
+```
+
+## Pfam domain variability
+
+```{python}
+#| label: domain-var
+#| echo: false
+
+if not domain_df.empty:
+    dom_col = next((c for c in domain_df.columns if 'pfam_id' in c.lower()), None) \
+              or next((c for c in domain_df.columns if 'domain' in c.lower() or 'pfam' in c.lower()), None)
+    var_col = next((c for c in domain_df.columns if 'variability' in c.lower() or 'entropy' in c.lower()), None)
+
+    if dom_col and var_col:
+        # Aggregate to domain level (average across instances per gene)
+        dom_agg = domain_df.groupby([dom_col, 'gene'])[var_col].mean().reset_index() \
+                  if 'gene' in domain_df.columns else domain_df.copy()
+
+        # Merge pfam descriptions if available
+        label_col = dom_col
+        if not pfam_desc_df.empty and 'pfam_id' in pfam_desc_df.columns and 'pfam_description' in pfam_desc_df.columns:
+            dom_agg = dom_agg.merge(pfam_desc_df[['pfam_id', 'pfam_description']], left_on=dom_col, right_on='pfam_id', how='left')
+            dom_agg['domain_label'] = dom_agg.apply(
+                lambda r: f"{r[dom_col]}: {r['pfam_description'][:55]}" if pd.notna(r.get('pfam_description')) else r[dom_col],
+                axis=1
+            )
+            label_col = 'domain_label'
+
+        top_domains = dom_agg.groupby(dom_col)[var_col].median().nlargest(30).index
+        df_plot = dom_agg[dom_agg[dom_col].isin(top_domains)].copy()
+        order_ids = df_plot.groupby(dom_col)[var_col].median().sort_values().index.tolist()
+        # Map to labels for ordering
+        id_to_label = df_plot.drop_duplicates(dom_col).set_index(dom_col)[label_col].to_dict()
+        order_labels = [id_to_label[i] for i in order_ids if i in id_to_label]
+
+        fig = px.box(df_plot, x=var_col, y=label_col,
+                     category_orders={label_col: order_labels},
+                     title='Variability distribution by Pfam domain (top 30 by median, per-gene mean)',
+                     labels={var_col: 'Mean variability', label_col: 'Pfam domain'},
+                     color_discrete_sequence=[T10[2]])
+        show_fig(fig, height=max(500, len(order_labels) * 26))
+
+        # Summary table: domain, description, n_genes, median_var
+        summary = domain_df.groupby(dom_col).agg(
+            n_genes=('gene', 'nunique') if 'gene' in domain_df.columns else (var_col, 'count'),
+            median_variability=(var_col, 'median'),
+            mean_variability=(var_col, 'mean'),
+        ).reset_index().sort_values('median_variability', ascending=False)
+        if not pfam_desc_df.empty and 'pfam_description' in pfam_desc_df.columns:
+            summary = summary.merge(pfam_desc_df[['pfam_id', 'pfam_description']], left_on=dom_col, right_on='pfam_id', how='left')
+        ishow(summary.reset_index(drop=True), caption="Pfam domain variability summary")
+else:
+    display(Markdown("*Pfam domain variability requires --run_hmmscan or --hmmscan_domtblout.*"))
+```
+
+## Circular phylogenetic trees
+
+```{python}
+#| label: phylo-tree-helpers
+#| echo: false
+
+def _build_tip_variability(tree, taxid_df, clade_var_df, level, fam_order_df=None):
+    """Return (tip_colors, clade_mean_map, (vmin, vmax)) for tips coloured by clade mean variability."""
+    import matplotlib.colors as _mc
+    import matplotlib.pyplot as _plt
+
+    tip_names = tree.get_tip_labels()
+
+    # ── Resolve species → clade mapping ─────────────────────────────────────
+    sp_col = next((c for c in taxid_df.columns if c.lower() == 'species'), None)
+    cl_col = next((c for c in taxid_df.columns if level in c.lower()), None)
+
+    # Fallback for 'order': join via family→order mapping when taxid lacks an order column
+    if cl_col is None and level == 'order' and fam_order_df is not None and not fam_order_df.empty:
+        fam_col = next((c for c in taxid_df.columns if 'family' in c.lower()), None)
+        fo_fam  = next((c for c in fam_order_df.columns if 'family' in c.lower()), None)
+        fo_ord  = next((c for c in fam_order_df.columns if 'order'  in c.lower()), None)
+        if fam_col and fo_fam and fo_ord:
+            taxid_df = taxid_df.merge(
+                fam_order_df[[fo_fam, fo_ord]].rename(columns={fo_ord: '_order'}),
+                left_on=fam_col, right_on=fo_fam, how='left'
+            )
+            cl_col = '_order'
+
+    if sp_col is None or cl_col is None:
+        return None, None, None
+
+    tax = taxid_df[[sp_col, cl_col]].copy()
+    tax['_tip'] = tax[sp_col].str.replace(' ', '_', regex=False)
+    sp_to_clade = tax.drop_duplicates('_tip').set_index('_tip')[cl_col].to_dict()
+
+    # ── Aggregate clade mean variability ────────────────────────────────────
+    sub = clade_var_df[clade_var_df['clade_level'] == level] if not clade_var_df.empty else pd.DataFrame()
+    if sub.empty or 'clade_name' not in sub.columns or 'mean_variability' not in sub.columns:
+        return None, None, None
+    clade_mean = sub.groupby('clade_name')['mean_variability'].mean().to_dict()
+
+    # ── Build per-tip colour values ───────────────────────────────────────────
+    tip_clades = [sp_to_clade.get(t, None) for t in tip_names]
+    vals = np.array([clade_mean.get(c, np.nan) if c else np.nan for c in tip_clades], dtype=float)
+
+    vmin, vmax = np.nanmin(vals), np.nanmax(vals)
+    vals_norm = (vals - vmin) / (vmax - vmin + 1e-9)
+
+    _cmap = _plt.get_cmap("RdYlBu_r")
+    colors = [_mc.to_hex(_cmap(v)) if not np.isnan(v) else "#cccccc" for v in vals_norm]
+
+    return colors, clade_mean, (vmin, vmax)
+
+
+def _draw_variability_tree(tree, tip_colors, level, vmin, vmax, out_html):
+    import toyplot, toyplot.html
+
+    tip_names = tree.get_tip_labels()
+    n_tips  = len(tip_names)
+    n_nodes = tree.nnodes
+
+    # Colour tip nodes with sized markers; internal nodes invisible
+    node_col = tip_colors + ['rgba(0,0,0,0)'] * (n_nodes - n_tips)
+    node_sz  = [4] * n_tips + [0] * (n_nodes - n_tips)
+
+    canvas, *_ = tree.draw(
+        layout='c',
+        edge_type='c',
+        tip_labels=False,
+        tip_labels_align=False,
+        node_colors=node_col,
+        node_sizes=node_sz,
+        width=720,
+        height=720,
+    )
+
+    toyplot.html.render(canvas, out_html)
+    from IPython.display import HTML
+    display(HTML(open(out_html).read()))
+    display(Markdown(
+        f"*Tip marker colour = mean Valdar variability of the tip's {level} "
+        f"(RdYlBu_r scale, min={vmin:.3f} → max={vmax:.3f}). "
+        f"Grey tips: {level} not found in clade variability data.*"
+    ))
+```
+
+```{python}
+#| label: phylo-tree-order
+#| echo: false
+
+if not (SPECIES_TREE and Path(SPECIES_TREE).exists()):
+    display(Markdown("*Species tree not available — pass `--psel_species_tree`.*"))
+elif clade_var_df.empty:
+    display(Markdown("*Clade variability data not available — CLADE_VARIABILITY_TSV not staged.*"))
+elif taxid_df.empty:
+    display(Markdown("*Taxid data not available — pass `--taxid_tsv`.*"))
+else:
+    try:
+        import toytree
+        from IPython.display import HTML
+
+        tree = toytree.tree(SPECIES_TREE)
+
+        _fam_ord = fam_order_df if not fam_order_df.empty else None
+
+        display(Markdown("### By order"))
+        colors_ord, _, range_ord = _build_tip_variability(tree, taxid_df, clade_var_df, 'order', _fam_ord)
+        if colors_ord is not None:
+            _draw_variability_tree(tree, colors_ord, 'order', *range_ord, "phylo_var_order.html")
+        else:
+            display(Markdown("*Could not map tips to orders — check taxid_tsv columns (need 'order' column or family_order_tsv).*"))
+
+        display(Markdown("### By family"))
+        colors_fam, _, range_fam = _build_tip_variability(tree, taxid_df, clade_var_df, 'family', _fam_ord)
+        if colors_fam is not None:
+            _draw_variability_tree(tree, colors_fam, 'family', *range_fam, "phylo_var_family.html")
+        else:
+            display(Markdown("*Could not map tips to families — check taxid_tsv columns.*"))
+
+    except ImportError:
+        display(Markdown("*toytree not installed — circular trees skipped.*"))
+    except Exception as e:
+        display(Markdown(f"*Could not render variability tree: {e}*"))
+```
+
+## Positive selection vs variability
+
+```{python}
+#| label: psel-var-overview
+#| echo: false
+
+if sel_var_df.empty:
+    display(Markdown(
+        "*Positive selection data not available — set `SEL_VARIABILITY_TSV` to "
+        "`sel_variability.tsv` from the positive-selection workflow.*"
+    ))
+else:
+    gene_col = next((c for c in sel_var_df.columns if c == 'gene'), sel_var_df.columns[0])
+    var_col  = next((c for c in sel_var_df.columns if c == 'mean_variability'), None)
+    pos_col  = next((c for c in sel_var_df.columns if 'n_pos' in c or 'pos_site' in c), None)
+    neg_col  = next((c for c in sel_var_df.columns if 'n_neg' in c or 'neg_site' in c), None)
+    post_col = next((c for c in sel_var_df.columns if 'mean_posterior' in c), None)
+
+    if var_col and (pos_col or post_col):
+        n_pos_total = int(sel_var_df[pos_col].sum())   if pos_col  else 'N/A'
+        n_neg_total = int(sel_var_df[neg_col].sum())   if neg_col  else 'N/A'
+        n_genes_pos = int((sel_var_df[pos_col] > 0).sum()) if pos_col else 'N/A'
+        display(Markdown(f"""
+| Metric | Value |
+|--------|-------|
+| Genes with selection data | **{len(sel_var_df)}** |
+| Total positively selected sites (FUBAR) | **{n_pos_total}** |
+| Total purifying sites (FUBAR) | **{n_neg_total}** |
+| Genes with ≥1 positive site | **{n_genes_pos}** |
+"""))
+```
+
+```{python}
+#| label: psel-var-positive
+#| echo: false
+
+if not sel_var_df.empty and var_col and pos_col:
+    sv = sel_var_df.copy()
+    sv['log_n_pos'] = np.log1p(sv[pos_col])
+
+    fig = px.scatter(
+        sv, x=var_col, y=pos_col,
+        color=post_col if post_col else pos_col,
+        color_continuous_scale='RdYlBu_r',
+        hover_name=gene_col,
+        title='Valdar variability vs positive selection (FUBAR n_pos_sites per gene)',
+        labels={var_col: 'Mean Valdar variability', pos_col: 'N positively selected sites',
+                post_col: 'Mean FUBAR posterior'},
+        opacity=0.7,
+    )
+    fig.update_traces(marker_size=5)
+    show_fig(fig, height=500)
+
+    # Correlation annotation
+    valid = sv[[var_col, pos_col]].dropna()
+    if len(valid) > 5:
+        from scipy.stats import spearmanr
+        rho, pval = spearmanr(valid[var_col], valid[pos_col])
+        display(Markdown(f"**Spearman ρ = {rho:.3f}**, p = {pval:.2e} (n = {len(valid)} genes)"))
+```
+
+```{python}
+#| label: psel-var-purifying
+#| echo: false
+
+if not sel_var_df.empty and var_col and neg_col:
+    sv = sel_var_df.copy()
+    fig = px.scatter(
+        sv, x=var_col, y=neg_col,
+        color=neg_col,
+        color_continuous_scale='Blues',
+        hover_name=gene_col,
+        title='Valdar variability vs purifying selection (FUBAR n_neg_sites per gene)',
+        labels={var_col: 'Mean Valdar variability', neg_col: 'N purifying sites'},
+        opacity=0.7,
+    )
+    fig.update_traces(marker_size=5)
+    show_fig(fig, height=500)
+
+    valid = sv[[var_col, neg_col]].dropna()
+    if len(valid) > 5:
+        from scipy.stats import spearmanr
+        rho, pval = spearmanr(valid[var_col], valid[neg_col])
+        display(Markdown(f"**Spearman ρ = {rho:.3f}**, p = {pval:.2e} (n = {len(valid)} genes)"))
+elif not sel_var_df.empty and var_col:
+    display(Markdown("*n_neg_sites column not found — FUBAR purifying column unavailable.*"))
+```
+
+```{python}
+#| label: psel-var-quadrant
+#| echo: false
+
+if not sel_var_df.empty and var_col and pos_col and neg_col:
+    sv = sel_var_df.copy()
+    # Classify genes into quadrants by median split
+    med_var = sv[var_col].median()
+    med_pos = sv[pos_col].median()
+    def _quadrant(row):
+        hi_var = row[var_col] >= med_var
+        hi_pos = row[pos_col] >= med_pos
+        if hi_var and hi_pos:   return 'High var / High pos'
+        if hi_var and not hi_pos: return 'High var / Low pos'
+        if not hi_var and hi_pos: return 'Low var / High pos'
+        return 'Low var / Low pos'
+    sv['quadrant'] = sv.apply(_quadrant, axis=1)
+
+    fig = px.scatter(
+        sv, x=var_col, y=pos_col,
+        color='quadrant',
+        size=neg_col if sv[neg_col].max() > 0 else None,
+        size_max=12,
+        hover_name=gene_col,
+        color_discrete_sequence=T10,
+        title='Variability vs positive selection — quadrant view (bubble size = n_neg_sites)',
+        labels={var_col: 'Mean Valdar variability', pos_col: 'N positively selected sites'},
+        opacity=0.75,
+    )
+    fig.add_vline(x=med_var, line_dash='dash', line_color='grey', line_width=1)
+    fig.add_hline(y=med_pos, line_dash='dash', line_color='grey', line_width=1)
+    show_fig(fig, height=520)
+```
+
+### Pfam domain enrichment
+
+```{python}
+#| label: psel-pfam
+#| echo: false
+
+if sel_var_df.empty:
+    display(Markdown("*Requires SEL_VARIABILITY_TSV.*"))
+elif domain_df.empty:
+    display(Markdown("*Pfam enrichment requires DOMAIN_TSV (--run_hmmscan or --hmmscan_domtblout).*"))
+else:
+    dom_col = next((c for c in domain_df.columns if 'pfam_id' in c.lower()), None) \
+              or next((c for c in domain_df.columns if 'domain' in c.lower() or 'pfam' in c.lower()), None)
+    dvar_col = next((c for c in domain_df.columns if 'variability' in c.lower() or 'entropy' in c.lower()), None)
+
+    if dom_col and dvar_col and 'gene' in domain_df.columns and var_col and pos_col:
+        # Per-gene mean domain variability, joined with selection data
+        dom_gene = domain_df.groupby(['gene', dom_col])[dvar_col].mean().reset_index()
+        dom_gene.columns = ['gene', 'pfam_id', 'domain_variability']
+
+        sv_slim = sel_var_df[['gene', pos_col, neg_col if neg_col else pos_col]].copy()
+        if neg_col:
+            sv_slim.columns = ['gene', 'n_pos_sites', 'n_neg_sites']
+        else:
+            sv_slim.columns = ['gene', 'n_pos_sites']
+            sv_slim['n_neg_sites'] = np.nan
+
+        dom_sel = dom_gene.merge(sv_slim, on='gene', how='inner')
+
+        # Add pfam descriptions
+        label_col = 'pfam_id'
+        if not pfam_desc_df.empty and 'pfam_id' in pfam_desc_df.columns and 'pfam_description' in pfam_desc_df.columns:
+            dom_sel = dom_sel.merge(pfam_desc_df[['pfam_id', 'pfam_description']], on='pfam_id', how='left')
+            dom_sel['domain_label'] = dom_sel.apply(
+                lambda r: f"{r['pfam_id']}: {str(r.get('pfam_description',''))[:50]}"
+                          if pd.notna(r.get('pfam_description')) else r['pfam_id'], axis=1)
+            label_col = 'domain_label'
+        else:
+            dom_sel['domain_label'] = dom_sel['pfam_id']
+
+        # Aggregate per domain: median variability, median pos sites
+        dom_summary = dom_sel.groupby('pfam_id').agg(
+            domain_label=('domain_label', 'first'),
+            n_genes=('gene', 'nunique'),
+            median_domain_var=('domain_variability', 'median'),
+            median_pos_sites=('n_pos_sites', 'median'),
+            median_neg_sites=('n_neg_sites', 'median'),
+            mean_pos_sites=('n_pos_sites', 'mean'),
+        ).reset_index().sort_values('median_pos_sites', ascending=False)
+
+        top_doms = dom_summary.nlargest(30, 'n_genes')['pfam_id'].tolist()
+        dom_plot = dom_sel[dom_sel['pfam_id'].isin(top_doms)].copy()
+
+        # ── Box plot: variability per domain, coloured by median positive selection ──────────
+        dom_order_by_var = (dom_plot.groupby(label_col)['domain_variability']
+                            .median().sort_values().index.tolist())
+        dom_med_pos = (dom_plot.groupby(label_col)['n_pos_sites']
+                       .median().reindex(dom_order_by_var).fillna(0))
+        color_map = {lbl: px.colors.sample_colorscale(
+                        'RdYlBu_r', [float(dom_med_pos[lbl]) / (dom_med_pos.max() + 1e-9)])[0]
+                     for lbl in dom_order_by_var}
+
+        fig = px.box(dom_plot, x='domain_variability', y=label_col,
+                     category_orders={label_col: dom_order_by_var},
+                     color=label_col,
+                     color_discrete_map=color_map,
+                     title='Domain variability distribution (top 30 domains by gene count, coloured by median n_pos_sites)',
+                     labels={'domain_variability': 'Mean domain variability', label_col: 'Pfam domain'})
+        fig.update_layout(showlegend=False, height=max(500, len(dom_order_by_var) * 26))
+        show_fig(fig)
+
+        # ── Scatter: median domain variability vs median positive selection ────────────────
+        fig2 = px.scatter(
+            dom_summary, x='median_domain_var', y='median_pos_sites',
+            size='n_genes', size_max=20,
+            color='median_neg_sites',
+            color_continuous_scale='Blues',
+            hover_name='domain_label',
+            hover_data={'n_genes': True, 'median_domain_var': ':.3f',
+                        'median_pos_sites': True, 'median_neg_sites': True},
+            title='Pfam domains: median domain variability vs positive selection signal',
+            labels={'median_domain_var': 'Median domain variability',
+                    'median_pos_sites':  'Median n_pos_sites (FUBAR)',
+                    'median_neg_sites':  'Median n_neg_sites'},
+        )
+        show_fig(fig2, height=520)
+
+        ishow(dom_summary.sort_values('median_pos_sites', ascending=False).reset_index(drop=True),
+              caption="Pfam domain enrichment: variability vs selection signal (all domains)")
+    else:
+        display(Markdown("*Could not build Pfam enrichment — check domain_tsv and sel_variability_tsv columns.*"))
+```
+
+## Clade outliers
+
+```{python}
+#| label: clade-outliers
+#| echo: false
+
+if not clade_out_df.empty:
+    # Show top outlier gene×clade pairs sorted by |z_score|
+    z_col   = next((c for c in clade_out_df.columns if 'z_score' in c.lower() or 'z-score' in c.lower()), None)
+    g_col   = next((c for c in clade_out_df.columns if 'gene' in c.lower()), clade_out_df.columns[0])
+    cl_col  = next((c for c in clade_out_df.columns if 'clade_name' in c.lower()), None)
+    lv_col  = next((c for c in clade_out_df.columns if 'clade_level' in c.lower()), None)
+
+    if z_col:
+        sorted_out = clade_out_df.sort_values(z_col, ascending=False)
+
+        # Top outlier plot: scatter z-score vs mean_variability coloured by clade level
+        fig = px.scatter(
+            sorted_out.head(200),
+            x='mean_variability' if 'mean_variability' in sorted_out.columns else sorted_out.columns[3],
+            y=z_col,
+            color=lv_col if lv_col else cl_col,
+            hover_data=[g_col, cl_col] if cl_col else [g_col],
+            title='Clade outliers: z-score vs mean variability (top 200)',
+            labels={z_col: 'Z-score', 'mean_variability': 'Mean variability (clade)'},
+        )
+        fig.add_hline(y=0, line_dash='dash', line_color='grey')
+        show_fig(fig)
+
+        # Full table
+        ishow(sorted_out.reset_index(drop=True),
+              caption="All clade outlier gene×clade pairs (sorted by z-score descending)")
+    else:
+        ishow(clade_out_df.reset_index(drop=True), caption="Clade outliers")
+else:
+    display(Markdown("*No clade outlier data (clade_outliers.tsv not found or empty). "
+                     "Requires taxid_tsv and zscore_threshold to be set in the variability workflow.*"))
+```
+
+## Ultra-conserved regions (UCR)
+
+```{python}
+#| label: ucr-overview
+#| echo: false
+
+if ucr_win_df.empty:
+    display(Markdown("*UCR data not available — run with `--run_ucr true`.*"))
+else:
+    gene_col_w  = next((c for c in ucr_win_df.columns if 'gene' in c.lower()), ucr_win_df.columns[0])
+    len_col     = next((c for c in ucr_win_df.columns if 'len' in c.lower() or 'length' in c.lower()), None)
+    ctrident_col = next((c for c in ucr_win_df.columns if 'c_trident' in c.lower() or 'trident' in c.lower()), None)
+    method_col  = next((c for c in ucr_win_df.columns if 'method' in c.lower()), None)
+
+    n_ucr_genes = ucr_win_df[gene_col_w].nunique()
+    n_ucr_total = len(ucr_win_df)
+
+    display(Markdown(f"""
+| Metric | Value |
+|--------|-------|
+| Genes with ≥1 UCR window | **{n_ucr_genes}** |
+| Total UCR windows detected | **{n_ucr_total}** |
+"""))
+
+    if method_col:
+        method_counts = ucr_win_df[method_col].value_counts().reset_index()
+        method_counts.columns = ['Method', 'Count']
+        fig = px.bar(method_counts, x='Method', y='Count',
+                     title='UCR windows by detection method',
+                     color='Method', color_discrete_sequence=T10)
+        fig.update_layout(showlegend=False)
+        show_fig(fig)
+
+    if len_col:
+        fig2 = px.histogram(ucr_win_df, x=len_col, nbins=40,
+                            title='UCR window length distribution (amino acids)',
+                            labels={len_col: 'Window length (aa)'},
+                            color_discrete_sequence=[T10[2]])
+        fig2.update_layout(bargap=0.05)
+        show_fig(fig2)
+
+    if ctrident_col:
+        fig3 = px.histogram(ucr_win_df, x=ctrident_col, nbins=40,
+                            title='UCR mean C_trident distribution',
+                            labels={ctrident_col: 'Mean C_trident'},
+                            color_discrete_sequence=[T10[0]])
+        fig3.update_layout(bargap=0.05)
+        show_fig(fig3)
+
+    ishow(ucr_win_df.reset_index(drop=True), caption="All detected UCR windows")
+```
+
+### UCR per clade
+
+```{python}
+#| label: ucr-clade
+#| echo: false
+
+if ucr_win_df.empty:
+    display(Markdown("*No UCR data.*"))
+elif taxid_df.empty:
+    display(Markdown("*Clade-level UCR requires TAXID_TSV.*"))
+else:
+    # Join UCR windows with gene variability to get clade membership
+    # UCR windows are at gene level — join via var_df to get clade data from clade_var_df
+    gene_col_w = next((c for c in ucr_win_df.columns if 'gene' in c.lower()), ucr_win_df.columns[0])
+    len_col    = next((c for c in ucr_win_df.columns if 'len' in c.lower() or 'length' in c.lower()), None)
+    ctrident_col = next((c for c in ucr_win_df.columns if 'c_trident' in c.lower() or 'trident' in c.lower()), None)
+
+    # Per-gene UCR summary
+    agg_cols = {gene_col_w: 'gene'}
+    if len_col:        agg_cols['n_ucr'] = (len_col, 'count')
+    if len_col:        agg_cols['mean_ucr_len'] = (len_col, 'mean')
+    if ctrident_col:   agg_cols['mean_ctrident'] = (ctrident_col, 'mean')
+
+    ucr_gene = (ucr_win_df.groupby(gene_col_w)
+                 .agg(**{k: v for k, v in agg_cols.items() if k != gene_col_w})
+                 .reset_index()
+                 .rename(columns={gene_col_w: 'gene'}))
+
+    if not clade_var_df.empty:
+        # Merge UCR per-gene with clade_var for each level
+        gene_clade_var = clade_var_df.copy()
+        gcv_gene = next((c for c in gene_clade_var.columns if 'gene' in c.lower()), None)
+        if gcv_gene:
+            ucr_clade = gene_clade_var.merge(ucr_gene, left_on=gcv_gene, right_on='gene', how='inner')
+            for level in ['order', 'family']:
+                sub = ucr_clade[ucr_clade['clade_level'] == level] if 'clade_level' in ucr_clade.columns else pd.DataFrame()
+                if sub.empty:
+                    continue
+                cn = 'clade_name'
+                if cn not in sub.columns:
+                    continue
+                display(Markdown(f"#### By {level.capitalize()}"))
+                # Mean n_ucr and mean_variability per clade
+                plot_cols = [c for c in ['n_ucr', 'mean_ucr_len', 'mean_ctrident', 'mean_variability'] if c in sub.columns]
+                if 'n_ucr' in sub.columns:
+                    clade_ucr = sub.groupby(cn)['n_ucr'].mean().reset_index()
+                    clade_ucr.columns = [level.capitalize(), 'Mean UCR windows per gene']
+                    clade_ucr = clade_ucr.sort_values('Mean UCR windows per gene', ascending=True)
+                    fig = px.bar(clade_ucr, x='Mean UCR windows per gene', y=level.capitalize(),
+                                 orientation='h',
+                                 title=f'Mean UCR windows per gene by {level}',
+                                 color_discrete_sequence=[T10[1]])
+                    fig.update_layout(height=max(400, len(clade_ucr) * 22))
+                    show_fig(fig)
+        else:
+            display(Markdown("*Could not find gene column in clade variability data.*"))
+    else:
+        display(Markdown("*Clade variability data required for clade-level UCR breakdown.*"))
+```
+
+### UCR per Pfam domain
+
+```{python}
+#| label: ucr-pfam
+#| echo: false
+
+if ucr_win_df.empty:
+    display(Markdown("*No UCR data.*"))
+elif domain_df.empty:
+    display(Markdown("*Pfam UCR analysis requires domain data (--run_hmmscan).*"))
+else:
+    gene_col_w   = next((c for c in ucr_win_df.columns if 'gene' in c.lower()), ucr_win_df.columns[0])
+    len_col      = next((c for c in ucr_win_df.columns if 'len' in c.lower() or 'length' in c.lower()), None)
+    ctrident_col = next((c for c in ucr_win_df.columns if 'c_trident' in c.lower() or 'trident' in c.lower()), None)
+    dom_col      = next((c for c in domain_df.columns if 'pfam_id' in c.lower()), None) \
+                   or next((c for c in domain_df.columns if 'domain' in c.lower() or 'pfam' in c.lower()), None)
+
+    if dom_col and 'gene' in domain_df.columns:
+        ucr_gene_sum = (ucr_win_df.groupby(gene_col_w)
+                        .agg(n_ucr=(gene_col_w, 'count'),
+                             **({'mean_ctrident': (ctrident_col, 'mean')} if ctrident_col else {}),
+                             **({'mean_ucr_len':  (len_col, 'mean')}       if len_col else {}))
+                        .reset_index()
+                        .rename(columns={gene_col_w: 'gene'}))
+
+        dom_ucr = domain_df[['gene', dom_col]].drop_duplicates().merge(ucr_gene_sum, on='gene', how='inner')
+
+        if not pfam_desc_df.empty and 'pfam_id' in pfam_desc_df.columns:
+            dom_ucr = dom_ucr.merge(pfam_desc_df[['pfam_id', 'pfam_description']], left_on=dom_col, right_on='pfam_id', how='left')
+            dom_ucr['domain_label'] = dom_ucr.apply(
+                lambda r: f"{r[dom_col]}: {str(r.get('pfam_description',''))[:50]}"
+                          if pd.notna(r.get('pfam_description')) else r[dom_col], axis=1)
+        else:
+            dom_ucr['domain_label'] = dom_ucr[dom_col]
+
+        dom_sum = dom_ucr.groupby('domain_label').agg(
+            n_genes_with_ucr=('gene', 'nunique'),
+            mean_n_ucr=('n_ucr', 'mean'),
+            **({'mean_ctrident': ('mean_ctrident', 'mean')} if 'mean_ctrident' in dom_ucr.columns else {}),
+        ).reset_index().sort_values('mean_n_ucr', ascending=False)
+
+        top30 = dom_sum.head(30).sort_values('mean_n_ucr', ascending=True)
+        color_arg = {'color': 'mean_ctrident', 'color_continuous_scale': 'Blues'} if 'mean_ctrident' in top30.columns else {'color_discrete_sequence': [T10[4]]}
+        fig = px.bar(top30, x='mean_n_ucr', y='domain_label', orientation='h',
+                     title='Mean UCR windows per gene by Pfam domain (top 30)',
+                     labels={'mean_n_ucr': 'Mean UCR windows per gene', 'domain_label': 'Pfam domain'},
+                     **color_arg)
+        fig.update_layout(height=max(400, len(top30) * 22))
+        show_fig(fig)
+
+        ishow(dom_sum.reset_index(drop=True), caption="UCR presence by Pfam domain")
+    else:
+        display(Markdown("*Could not find required columns in domain_tsv for UCR–Pfam analysis.*"))
+```
+
+## Variability × UCR × Positive selection
+
+```{python}
+#| label: triple-join-data
+#| echo: false
+
+# Build a per-gene table joining all three data sources
+triple_df = pd.DataFrame()
+has_var = not var_df.empty
+has_ucr = not ucr_win_df.empty
+has_sel = not sel_var_df.empty
+
+if has_var:
+    gene_col_v = next((c for c in var_df.columns if 'gene' in c.lower()), var_df.columns[0])
+    triple_df = var_df[[gene_col_v, 'mean_variability']].rename(columns={gene_col_v: 'gene'}).copy()
+
+if has_ucr and not triple_df.empty:
+    gene_col_w   = next((c for c in ucr_win_df.columns if 'gene' in c.lower()), ucr_win_df.columns[0])
+    len_col      = next((c for c in ucr_win_df.columns if 'len' in c.lower() or 'length' in c.lower()), None)
+    ctrident_col = next((c for c in ucr_win_df.columns if 'c_trident' in c.lower() or 'trident' in c.lower()), None)
+    agg_d = {gene_col_w: 'count'}
+    if ctrident_col: agg_d[ctrident_col] = 'mean'
+    if len_col:      agg_d[len_col]      = 'mean'
+    ucr_sum = ucr_win_df.groupby(gene_col_w).agg(
+        n_ucr=(gene_col_w, 'count'),
+        **({'mean_ctrident': (ctrident_col, 'mean')} if ctrident_col else {}),
+        **({'mean_ucr_len':  (len_col, 'mean')}       if len_col else {}),
+    ).reset_index().rename(columns={gene_col_w: 'gene'})
+    triple_df = triple_df.merge(ucr_sum, on='gene', how='left')
+    triple_df['n_ucr'] = triple_df['n_ucr'].fillna(0).astype(int)
+    triple_df['has_ucr'] = triple_df['n_ucr'] > 0
+
+if has_sel and not triple_df.empty:
+    gene_col_s = next((c for c in sel_var_df.columns if 'gene' in c.lower()), sel_var_df.columns[0])
+    pos_col    = next((c for c in sel_var_df.columns if 'n_pos' in c or 'pos_site' in c), None)
+    neg_col    = next((c for c in sel_var_df.columns if 'n_neg' in c or 'neg_site' in c), None)
+    keep = [gene_col_s] + [c for c in [pos_col, neg_col] if c]
+    sel_slim = sel_var_df[keep].rename(columns={gene_col_s: 'gene'})
+    triple_df = triple_df.merge(sel_slim, on='gene', how='left')
+
+avail = []
+if has_var: avail.append('variability')
+if has_ucr: avail.append('UCR')
+if has_sel: avail.append('positive selection')
+print(f"Triple join: {len(triple_df)} genes | sources: {', '.join(avail) or 'none'}")
+```
+
+```{python}
+#| label: triple-join-plot
+#| echo: false
+
+if triple_df.empty or not has_var:
+    display(Markdown("*Gene variability data required for cross-workflow integration.*"))
+elif not has_ucr and not has_sel:
+    display(Markdown("*No UCR or positive selection data available for integration.*"))
+else:
+    # ── Variability × UCR ────────────────────────────────────────────────────
+    if has_ucr and 'n_ucr' in triple_df.columns:
+        display(Markdown("### Variability × UCR"))
+        fig = px.box(
+            triple_df, x='has_ucr', y='mean_variability',
+            color='has_ucr',
+            color_discrete_map={True: T10[0], False: T10[1]},
+            labels={'has_ucr': 'Has UCR window', 'mean_variability': 'Mean Valdar variability'},
+            title='Variability distribution: genes with vs without UCR windows',
+            category_orders={'has_ucr': [True, False]},
+        )
+        show_fig(fig)
+
+        if 'mean_ctrident' in triple_df.columns:
+            ucr_only = triple_df[triple_df['has_ucr']].dropna(subset=['mean_variability', 'mean_ctrident'])
+            if not ucr_only.empty:
+                fig2 = px.scatter(
+                    ucr_only, x='mean_variability', y='mean_ctrident',
+                    size='n_ucr', size_max=12,
+                    color='n_ucr', color_continuous_scale='Blues',
+                    hover_name='gene',
+                    title='Genes with UCRs: mean variability vs mean C_trident (size = n UCR windows)',
+                    labels={'mean_variability': 'Mean Valdar variability', 'mean_ctrident': 'Mean C_trident', 'n_ucr': 'N UCR windows'},
+                    opacity=0.75,
+                )
+                show_fig(fig2, height=500)
+
+    # ── Variability × Positive selection ─────────────────────────────────────
+    if has_sel:
+        pos_col_t = next((c for c in triple_df.columns if 'n_pos' in c), None)
+        if pos_col_t:
+            display(Markdown("### Variability × Positive selection"))
+            fig3 = px.scatter(
+                triple_df.fillna({pos_col_t: 0}),
+                x='mean_variability', y=pos_col_t,
+                color=pos_col_t, color_continuous_scale='RdYlBu_r',
+                hover_name='gene',
+                title='Mean variability vs positive selection (FUBAR positive sites per gene)',
+                labels={'mean_variability': 'Mean Valdar variability', pos_col_t: 'FUBAR positive sites'},
+                opacity=0.7,
+            )
+            fig3.update_traces(marker_size=5)
+            show_fig(fig3, height=500)
+
+    # ── UCR × Positive selection ──────────────────────────────────────────────
+    if has_ucr and has_sel and 'n_ucr' in triple_df.columns:
+        pos_col_t = next((c for c in triple_df.columns if 'n_pos' in c), None)
+        if pos_col_t:
+            display(Markdown("### UCR × Positive selection"))
+            fig4 = px.scatter(
+                triple_df.fillna({pos_col_t: 0}),
+                x='n_ucr', y=pos_col_t,
+                color='mean_variability', color_continuous_scale='RdYlBu_r',
+                hover_name='gene',
+                size='mean_variability', size_max=10,
+                title='UCR windows vs positive selection per gene (colour = mean variability)',
+                labels={'n_ucr': 'N UCR windows', pos_col_t: 'FUBAR positive sites',
+                        'mean_variability': 'Mean variability'},
+                opacity=0.7,
+            )
+            show_fig(fig4, height=500)
+
+    # ── All three: quadrant classification ────────────────────────────────────
+    if has_ucr and has_sel and 'n_ucr' in triple_df.columns:
+        pos_col_t = next((c for c in triple_df.columns if 'n_pos' in c), None)
+        neg_col_t = next((c for c in triple_df.columns if 'n_neg' in c), None)
+        if pos_col_t:
+            display(Markdown("### Three-way gene classification"))
+            t = triple_df.copy().fillna({pos_col_t: 0})
+            med_var = t['mean_variability'].median()
+            def _classify(row):
+                hi_var = row['mean_variability'] >= med_var
+                has_u  = row.get('has_ucr', False)
+                hi_pos = row.get(pos_col_t, 0) > 0
+                if hi_var  and has_u  and hi_pos: return 'Variable + UCR + Positive sel.'
+                if hi_var  and has_u             : return 'Variable + UCR'
+                if hi_var  and hi_pos            : return 'Variable + Positive sel.'
+                if not hi_var and has_u           : return 'Conserved + UCR'
+                if not hi_var and hi_pos          : return 'Conserved + Positive sel.'
+                if hi_var                         : return 'Variable only'
+                return 'Conserved only'
+            t['class'] = t.apply(_classify, axis=1)
+            cls_counts = t['class'].value_counts().reset_index()
+            cls_counts.columns = ['Class', 'N genes']
+            fig5 = px.bar(cls_counts.sort_values('N genes', ascending=True),
+                          x='N genes', y='Class', orientation='h',
+                          title='Gene classification: variability × UCR × positive selection',
+                          color='Class', color_discrete_sequence=T10)
+            fig5.update_layout(showlegend=False, height=max(400, len(cls_counts) * 32))
+            show_fig(fig5)
+            ishow(t.sort_values('mean_variability', ascending=False).reset_index(drop=True),
+                  caption="Per-gene three-way classification")
+```

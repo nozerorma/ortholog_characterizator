@@ -1,0 +1,772 @@
+---
+title: "Post-Translation Alignment Quality Report"
+date: today
+format:
+  html:
+    toc: true
+    toc-float: true
+    toc-depth: 3
+    theme: flatly
+    code-fold: true
+    embed-resources: true
+    fig-width: 11
+    fig-height: 6
+jupyter: python3
+execute:
+  dir: file
+---
+
+```{=html}
+<style>
+.cell-output-display { margin-top: 2em; }
+h2, h3 { margin-top: 1.8em; }
+</style>
+```
+
+```{python}
+#| label: setup
+#| echo: false
+
+import os, warnings
+from pathlib import Path
+
+import numpy  as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from itables import show as ishow
+import itables.options as ito
+
+warnings.filterwarnings("ignore")
+
+# ── Parameters from environment (set by Nextflow process) ─────────────────────
+PROT_DIR         = os.environ.get("PROT_DIR",         ".")
+METADATA_TSV     = os.environ.get("METADATA_TSV",     "")
+QUALITY_TSV      = os.environ.get("QUALITY_TSV",      "quality_data_quality_per_gene.csv")
+ASSEMBLIES_TSV   = os.environ.get("ASSEMBLIES_TSV",   "")
+TAXID_TSV        = os.environ.get("TAXID_TSV",        "")
+FAMILY_ORDER_TSV = os.environ.get("FAMILY_ORDER_TSV", "")
+DEDUP_DIR        = os.environ.get("DEDUP_DIR",        "")
+PREFILTER_DIR    = os.environ.get("PREFILTER_DIR",    "")
+FILTER_MODE      = os.environ.get("FILTER_MODE",      "chi2")
+TRIM_DIR         = os.environ.get("TRIM_DIR",         "")
+TRANSLATION_MODE = os.environ.get("TRANSLATION_MODE", "bmge")
+SPECIES_TREE     = os.environ.get("SPECIES_TREE",     "")
+
+T10 = px.colors.qualitative.T10
+TPL = "plotly_white"
+
+ito.maxBytes        = 0
+ito.maxRows         = 500
+ito.classes         = "display compact"
+ito.paging          = True
+ito.pageLength      = 20
+ito.scrollX         = True
+
+def show_fig(fig, height=None):
+    kw = {"height": height} if height else {}
+    fig.update_layout(template=TPL, margin=dict(t=60, b=40), **kw)
+    fig.show()
+
+def _safe(path):
+    return bool(path and Path(path).exists())
+```
+
+```{python}
+#| label: load-data
+#| echo: false
+
+# ── Per-gene quality stats (primary source) ────────────────────────────────────
+# quality_data_quality_per_gene.csv: gene, raw_n_seq, raw_aln_len, raw_mean_gap_pct, ...
+qual = pd.DataFrame()
+if _safe(QUALITY_TSV):
+    qual = pd.read_csv(QUALITY_TSV)
+    # Normalise column names so downstream code is consistent
+    rename = {
+        'raw_n_seq':          'n_seqs',
+        'raw_aln_len':        'aln_len',
+        'raw_mean_gap_pct':   'mean_gap_pct',
+        'raw_median_gap_pct': 'median_gap_pct',
+        'raw_n_highgap':      'n_highgap',
+        'raw_completeness_pct': 'completeness_pct',
+        'raw_mean_ambig_codon_pct': 'mean_ambig_pct',
+    }
+    qual = qual.rename(columns={k: v for k, v in rename.items() if k in qual.columns})
+
+# ── Global summary (metadata.combined_summary.tsv) ────────────────────────────
+summary_row = {}
+if _safe(METADATA_TSV):
+    try:
+        summary_row = pd.read_csv(METADATA_TSV, sep='\t').iloc[0].to_dict()
+    except Exception:
+        pass
+
+# ── Taxonomy / assembly tables ────────────────────────────────────────────────
+asm = pd.DataFrame()
+if _safe(ASSEMBLIES_TSV):
+    asm = pd.read_csv(ASSEMBLIES_TSV, sep='\t')
+
+taxid = pd.DataFrame()
+if _safe(TAXID_TSV):
+    taxid = pd.read_csv(TAXID_TSV, sep='\t')
+
+fam_order_df = pd.DataFrame()
+if _safe(FAMILY_ORDER_TSV):
+    fam_order_df = pd.read_csv(FAMILY_ORDER_TSV, sep='\t')
+
+# ── PROT FASTA inventory ───────────────────────────────────────────────────────
+prot_files = sorted(Path(PROT_DIR).glob("*.prot.fa")) or sorted(Path(PROT_DIR).glob("*.fa"))
+
+print(f"Per-gene quality rows: {len(qual)} | PROT FASTA files found: {len(prot_files)}")
+```
+
+## Overview
+
+```{python}
+#| label: overview
+#| echo: false
+
+from IPython.display import Markdown, display
+
+n_genes   = len(qual) if not qual.empty else len(prot_files)
+n_species = int(qual['n_seqs'].max())     if 'n_seqs' in qual.columns else summary_row.get('Sp/Protein Global Mean', 'N/A')
+mean_seqs = round(qual['n_seqs'].mean(), 1) if 'n_seqs' in qual.columns else 'N/A'
+mean_len  = round(qual['aln_len'].mean(), 1) if 'aln_len' in qual.columns else 'N/A'
+mean_comp = round(qual['completeness_pct'].mean(), 1) if 'completeness_pct' in qual.columns else 'N/A'
+
+display(Markdown(f"""
+| Metric | Value |
+|--------|-------|
+| Genes processed | **{n_genes}** |
+| Max species per gene | **{n_species}** |
+| Mean sequences per gene | **{mean_seqs}** |
+| Mean alignment length (codons) | **{mean_len}** |
+| Mean completeness (%) | **{mean_comp}** |
+| Translation mode | **{TRANSLATION_MODE}** |
+"""))
+```
+
+## Species count distribution
+
+```{python}
+#| label: species-dist
+#| echo: false
+
+if 'n_seqs' in qual.columns:
+    fig = px.histogram(qual, x='n_seqs', nbins=50,
+                       labels={'n_seqs': 'Sequences per gene'},
+                       title='Distribution of sequence counts per gene',
+                       color_discrete_sequence=[T10[0]])
+    fig.update_layout(bargap=0.05)
+    show_fig(fig)
+else:
+    display(Markdown("*n_seqs column not found in quality data.*"))
+```
+
+## Alignment length distribution
+
+```{python}
+#| label: aln-len
+#| echo: false
+
+cols_to_plot = [c for c in ['aln_len', 'n_highgap'] if c in qual.columns]
+if cols_to_plot:
+    subplot_titles = {
+        'aln_len':   'Alignment length (codons)',
+        'n_highgap': 'High-gap columns per gene',
+    }
+    titles = [subplot_titles.get(c, c) for c in cols_to_plot]
+    fig = make_subplots(rows=1, cols=len(cols_to_plot), subplot_titles=titles)
+    for i, col in enumerate(cols_to_plot, 1):
+        fig.add_trace(go.Histogram(x=qual[col], nbinsx=50,
+                                   name=col, marker_color=T10[i-1]), row=1, col=i)
+    fig.update_layout(title="Alignment length and gap-column distributions", showlegend=False)
+    show_fig(fig)
+else:
+    display(Markdown("*Alignment length columns not found in quality data.*"))
+```
+
+## Gap content
+
+```{python}
+#| label: gap-content
+#| echo: false
+
+gap_cols = [c for c in qual.columns if 'gap' in c.lower() or 'ambig' in c.lower()]
+if gap_cols:
+    fig = px.box(qual.melt(id_vars='gene' if 'gene' in qual.columns else qual.columns[0],
+                           value_vars=gap_cols, var_name='Metric', value_name='Value'),
+                 x='Metric', y='Value', color='Metric',
+                 color_discrete_sequence=T10,
+                 title='Gap and ambiguity metrics per gene (box plot)')
+    fig.update_layout(showlegend=False)
+    show_fig(fig)
+else:
+    display(Markdown("*No gap/ambiguity columns found in quality data.*"))
+```
+
+## Completeness distribution
+
+```{python}
+#| label: completeness
+#| echo: false
+
+if 'completeness_pct' in qual.columns:
+    fig = px.histogram(qual, x='completeness_pct', nbins=50,
+                       labels={'completeness_pct': 'Completeness (%)'},
+                       title='Gene completeness: % of sequences passing filters',
+                       color_discrete_sequence=[T10[2]])
+    fig.update_layout(bargap=0.05)
+    show_fig(fig)
+
+    low = qual[qual['completeness_pct'] < 80]
+    if not low.empty:
+        display(Markdown(f"**{len(low)} genes with completeness < 80%**"))
+        ishow(low.sort_values('completeness_pct').reset_index(drop=True),
+              caption="Low-completeness genes (<80%)")
+```
+
+## BMGE trimming statistics
+
+```{python}
+#| label: bmge-trim
+#| echo: false
+
+if TRANSLATION_MODE == 'bmge' and 'trim_len' in qual.columns and 'aln_len' in qual.columns:
+    qual['frac_trimmed'] = 1 - qual['trim_len'] / qual['aln_len'].replace(0, np.nan)
+    fig = px.histogram(qual, x='frac_trimmed', nbins=50,
+                       labels={'frac_trimmed': 'Fraction trimmed by BMGE'},
+                       title='BMGE: fraction of alignment columns trimmed per gene',
+                       color_discrete_sequence=[T10[1]])
+    fig.update_layout(bargap=0.05)
+    show_fig(fig)
+
+    q25, med, q75 = qual['frac_trimmed'].quantile([0.25, 0.5, 0.75])
+    display(Markdown(f"**Median fraction trimmed:** {med:.2%} (IQR {q25:.2%}–{q75:.2%})"))
+elif TRANSLATION_MODE != 'bmge':
+    display(Markdown("*Manual translation mode — no BMGE trim stats.*"))
+else:
+    display(Markdown("*BMGE trim_len column not found in quality data.*"))
+```
+
+## Taxonomy breakdown
+
+```{python}
+#| label: taxonomy
+#| echo: false
+
+if not taxid.empty and not asm.empty:
+    fam_col = next((c for c in taxid.columns if 'family' in c.lower()), None)
+
+    # Join assemblies ↔ taxid on numeric taxid ID (most reliable)
+    asm_taxid_col = next((c for c in asm.columns
+                          if 'taxonomy id' in c.lower() or c.lower() in ('taxid', 'tax_id')), None)
+    tax_id_col    = next((c for c in taxid.columns if c.lower() in ('tax_id', 'taxid')), None)
+
+    if asm_taxid_col and tax_id_col:
+        keep_tax = [tax_id_col] + ([fam_col] if fam_col else [])
+        asm_taxid = asm.merge(
+            taxid[keep_tax].drop_duplicates(subset=[tax_id_col]),
+            left_on=asm_taxid_col, right_on=tax_id_col, how='left'
+        )
+    else:
+        # Fallback: normalize species names (spaces ↔ underscores) and join
+        sp_col_asm = next((c for c in asm.columns if c.lower() == 'species'), None)
+        sp_col_tax = next((c for c in taxid.columns if c.lower() == 'species'), None)
+        if sp_col_asm and sp_col_tax:
+            asm2 = asm.copy()
+            asm2['_sp_key'] = asm2[sp_col_asm].str.replace(' ', '_', regex=False)
+            tax2 = taxid.copy()
+            tax2['_sp_key'] = tax2[sp_col_tax].str.replace(' ', '_', regex=False)
+            keep_tax = ['_sp_key'] + ([fam_col] if fam_col else [])
+            asm_taxid = asm2.merge(tax2[keep_tax].drop_duplicates('_sp_key'),
+                                   on='_sp_key', how='left').drop(columns='_sp_key')
+        else:
+            display(Markdown("*Could not join assemblies with taxid — no usable key column found.*"))
+            asm_taxid = pd.DataFrame()
+
+    # Resolve order: taxid file may lack an 'order' column; use family_to_order if available
+    order_col_name = next((c for c in (asm_taxid.columns if not asm_taxid.empty else [])
+                           if 'order' in c.lower()), None)
+    if order_col_name is None and fam_col and not fam_order_df.empty and not asm_taxid.empty:
+        fo_fam = next((c for c in fam_order_df.columns if 'family' in c.lower()), None)
+        fo_ord = next((c for c in fam_order_df.columns if 'order'  in c.lower()), None)
+        if fo_fam and fo_ord:
+            asm_taxid = asm_taxid.merge(
+                fam_order_df[[fo_fam, fo_ord]].rename(columns={fo_fam: fam_col, fo_ord: '_order'}),
+                on=fam_col, how='left'
+            )
+            order_col_name = '_order'
+
+    if not asm_taxid.empty and order_col_name:
+        order_counts = asm_taxid[order_col_name].value_counts().reset_index()
+        order_counts.columns = ['Order', 'n_assemblies']
+        order_counts = order_counts.sort_values('n_assemblies', ascending=True)
+
+        fig = px.bar(order_counts, x='n_assemblies', y='Order', orientation='h',
+                     title='Assemblies per mammalian order',
+                     color_discrete_sequence=[T10[2]])
+        fig.update_layout(height=max(400, len(order_counts) * 22))
+        show_fig(fig)
+
+        if fam_col and fam_col in asm_taxid.columns:
+            fam_counts = asm_taxid[fam_col].value_counts().reset_index()
+            fam_counts.columns = ['Family', 'n_assemblies']
+            fam_counts = fam_counts.sort_values('n_assemblies', ascending=True).tail(40)
+            fig2 = px.bar(fam_counts, x='n_assemblies', y='Family', orientation='h',
+                          title='Top 40 families by assembly count',
+                          color_discrete_sequence=[T10[4]])
+            fig2.update_layout(height=max(400, len(fam_counts) * 22))
+            show_fig(fig2)
+    elif not asm_taxid.empty:
+        display(Markdown("*Joined assemblies with taxid but no order column found. "
+                         "Pass `FAMILY_ORDER_TSV` to resolve orders from families.*"))
+else:
+    missing = []
+    if taxid.empty:  missing.append("taxid_tsv")
+    if asm.empty:    missing.append("assemblies_tsv")
+    display(Markdown(f"*Taxonomy breakdown requires: {', '.join(missing)}.*"))
+```
+
+## Assembly quality
+
+```{python}
+#| label: assembly-quality
+#| echo: false
+
+status_col = next((c for c in asm.columns if 'status' in c.lower() or 'level' in c.lower()), None)
+
+if not asm.empty and status_col:
+    status_order = ["Chromosome", "Complete Genome", "Scaffold", "Contig", "Zoonomia"]
+    counts = asm[status_col].value_counts().reindex(status_order).dropna().reset_index()
+    counts.columns = ['Assembly level', 'Count']
+
+    fig = px.bar(counts, x='Assembly level', y='Count',
+                 color='Assembly level',
+                 color_discrete_sequence=T10,
+                 title='Assemblies by quality level')
+    fig.update_layout(showlegend=False)
+    show_fig(fig)
+else:
+    display(Markdown("*Assembly quality breakdown requires assemblies_tsv with a status/level column.*"))
+```
+
+## Clade-level quality
+
+```{python}
+#| label: clade-helpers
+#| echo: false
+
+from Bio import SeqIO
+
+_CDS_AMBIG  = frozenset('-NnXx?')
+_PROT_AMBIG = frozenset('-Xx?')
+
+def _codon_ambig_pct(seq: str) -> float:
+    seq = seq.upper()
+    n_codons = len(seq) // 3
+    if not n_codons:
+        return 100.0
+    bad = sum(1 for i in range(0, n_codons * 3, 3)
+              if any(seq[i + j] in _CDS_AMBIG for j in range(3)))
+    return round(bad / n_codons * 100, 3)
+
+def _prot_gap_pct(seq: str) -> float:
+    n = len(seq)
+    return round(sum(1 for c in seq if c in _PROT_AMBIG) / n * 100, 3) if n else 100.0
+
+def _fa_gene_id(fa_path) -> str:
+    name = Path(fa_path).name
+    for ext in ('.prot.fa', '.trim.fa', '.dedup.fa', '.filtered.fa'):
+        if name.endswith(ext):
+            return name[:-len(ext)]
+    return Path(fa_path).stem
+
+def _read_fa_dir(dirpath, ambig_fn) -> pd.DataFrame:
+    p = Path(dirpath)
+    if not p.is_dir():
+        return pd.DataFrame()
+    rows = []
+    for fa in sorted(p.glob('*.fa')):
+        gid = _fa_gene_id(fa)
+        for rec in SeqIO.parse(fa, 'fasta'):
+            rows.append({'species': rec.id, 'gene': gid,
+                         'ambig_pct': ambig_fn(str(rec.seq))})
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+def _tax_join(df, taxid):
+    sp_col  = next((c for c in taxid.columns if c.lower() == 'species'), None)
+    ord_col = next((c for c in taxid.columns if 'order'  in c.lower()), None)
+    fam_col = next((c for c in taxid.columns if 'family' in c.lower()), None)
+    if not sp_col or df.empty:
+        return df
+    keep = [sp_col] + [c for c in [ord_col, fam_col] if c]
+    tax  = taxid[keep].copy()
+    tax['_sp'] = tax[sp_col].str.replace(' ', '_', regex=False)
+    out = df.copy()
+    out['_sp'] = out['species'].str.replace(' ', '_', regex=False)
+    return out.merge(tax.drop(columns=sp_col).drop_duplicates('_sp'),
+                     on='_sp', how='left').drop(columns='_sp')
+
+def _clade_summary(df, clade_col):
+    if clade_col not in df.columns or df.empty:
+        return pd.DataFrame()
+    sp_genes = (df.groupby(['species', clade_col])['gene']
+                  .nunique().reset_index()
+                  .rename(columns={'gene': 'n_genes'}))
+    ambig = (df.groupby(clade_col)['ambig_pct']
+               .agg(mean_ambig='mean', median_ambig='median')
+               .round(2).reset_index())
+    gene_ct = (sp_genes.groupby(clade_col)['n_genes']
+                 .agg(mean_genes='mean', median_genes='median', n_species='count')
+                 .round(2).reset_index())
+    return (ambig.merge(gene_ct, on=clade_col)
+                 .sort_values('mean_genes', ascending=False)
+                 .reset_index(drop=True))
+
+def _species_summary(df):
+    if df.empty:
+        return pd.DataFrame()
+    tax_cols = [c for c in df.columns if c not in ('gene', 'ambig_pct', 'stage')]
+    return (df.groupby(tax_cols, dropna=False)
+              .agg(n_genes=('gene', 'nunique'),
+                   mean_ambig=('ambig_pct', 'mean'),
+                   median_ambig=('ambig_pct', 'median'))
+              .round(2).reset_index()
+              .sort_values('n_genes', ascending=False)
+              .reset_index(drop=True))
+
+def _clade_bars(stages, clade_col, metric, title, xlabel, top_n=30):
+    """Side-by-side horizontal bar for one or more (df, label) stage pairs."""
+    dfs  = [_clade_summary(df, clade_col).assign(stage=lbl) for df, lbl in stages]
+    both = pd.concat(dfs, ignore_index=True)
+    top  = both.groupby(clade_col)['mean_genes'].mean().nlargest(top_n).index
+    plot = both[both[clade_col].isin(top)].sort_values([clade_col, 'stage'])
+    fig  = px.bar(plot, x=metric, y=clade_col, color='stage', barmode='group',
+                  orientation='h', title=title,
+                  labels={metric: xlabel},
+                  color_discrete_sequence=T10[:len(stages)])
+    fig.update_layout(height=max(400, len(top) * 30))
+    show_fig(fig)
+```
+
+```{python}
+#| label: clade-build-cds
+#| echo: false
+
+dedup_df     = pd.DataFrame()
+prefilter_df = pd.DataFrame()
+trim_cds_df  = pd.DataFrame()
+
+if _safe(DEDUP_DIR):
+    print(f"Reading DEDUP...", end=' ', flush=True)
+    dedup_df = _read_fa_dir(DEDUP_DIR, _codon_ambig_pct)
+    if not dedup_df.empty and not taxid.empty:
+        dedup_df = _tax_join(dedup_df, taxid)
+    print(f"{len(dedup_df):,} rows")
+
+if _safe(PREFILTER_DIR):
+    print(f"Reading PREFILTER/{FILTER_MODE}...", end=' ', flush=True)
+    prefilter_df = _read_fa_dir(PREFILTER_DIR, _codon_ambig_pct)
+    if not prefilter_df.empty and not taxid.empty:
+        prefilter_df = _tax_join(prefilter_df, taxid)
+    print(f"{len(prefilter_df):,} rows")
+
+if _safe(TRIM_DIR):
+    print(f"Reading TRIM/{TRANSLATION_MODE}...", end=' ', flush=True)
+    trim_cds_df = _read_fa_dir(TRIM_DIR, _codon_ambig_pct)
+    if not trim_cds_df.empty and not taxid.empty:
+        trim_cds_df = _tax_join(trim_cds_df, taxid)
+    print(f"{len(trim_cds_df):,} rows")
+
+# Ordered list of (label, df) for all available CDS stages
+_cds_stage_order = [
+    ('DEDUP',                   dedup_df),
+    (f'PREFILTER/{FILTER_MODE}', prefilter_df),
+    (f'TRIM/{TRANSLATION_MODE}', trim_cds_df),
+]
+cds_stages_data = [(lbl, df) for lbl, df in _cds_stage_order if not df.empty]
+cds_available   = [lbl for lbl, _ in cds_stages_data]
+print(f"CDS stages available: {cds_available or 'none'}")
+```
+
+```{python}
+#| label: clade-build-prot
+#| echo: false
+
+prot_seq_df = pd.DataFrame()
+
+if prot_files:
+    print(f"Reading PROT/{TRANSLATION_MODE}...", end=' ', flush=True)
+    rows = []
+    for fa in prot_files:
+        gid = _fa_gene_id(fa)
+        for rec in SeqIO.parse(fa, 'fasta'):
+            rows.append({'species': rec.id, 'gene': gid,
+                         'ambig_pct': _prot_gap_pct(str(rec.seq))})
+    if rows:
+        prot_seq_df = pd.DataFrame(rows)
+        if not taxid.empty:
+            prot_seq_df = _tax_join(prot_seq_df, taxid)
+        print(f"{len(prot_seq_df):,} rows")
+    else:
+        print("no sequences found")
+```
+
+### CDS: pipeline stages
+
+```{python}
+#| label: clade-cds-plots
+#| echo: false
+
+if not cds_available:
+    display(Markdown("*No CDS data — set `DEDUP_DIR`, `PREFILTER_DIR`, and/or `TRIM_DIR`.*"))
+else:
+    _first_df = cds_stages_data[0][1]
+    _ord_col  = next((c for c in _first_df.columns if 'order'  in c.lower()), None)
+    _fam_col  = next((c for c in _first_df.columns if 'family' in c.lower()), None)
+
+    for _cc, _cl in [(_ord_col, 'Order'), (_fam_col, 'Family')]:
+        if not _cc:
+            continue
+        display(Markdown(f"#### By {_cl}"))
+
+        # ── Ambiguity bars (all stages) ──────────────────────────────────────
+        _clade_bars([(df, lbl) for lbl, df in cds_stages_data], _cc,
+                    'mean_ambig',
+                    f'Mean codon ambiguity (%) per {_cl.lower()} — CDS pipeline stages',
+                    'Mean codon ambiguity (%)')
+
+        # ── Gene count bars (all stages) ─────────────────────────────────────
+        _clade_bars([(df, lbl) for lbl, df in cds_stages_data], _cc,
+                    'mean_genes',
+                    f'Mean gene count per species per {_cl.lower()} — CDS pipeline stages',
+                    'Mean gene count per species')
+
+        # ── Pairwise adjacent-stage ambiguity scatters ───────────────────────
+        for (lbl_a, df_a), (lbl_b, df_b) in zip(cds_stages_data, cds_stages_data[1:]):
+            sa = _clade_summary(df_a, _cc).set_index(_cc)[['mean_ambig']].rename(columns={'mean_ambig': lbl_a})
+            sb = _clade_summary(df_b, _cc).set_index(_cc)[['mean_ambig']].rename(columns={'mean_ambig': lbl_b})
+            pv = sa.join(sb, how='inner').reset_index()
+            pv['delta'] = pv[lbl_b] - pv[lbl_a]
+            _lim = max(pv[lbl_a].max(), pv[lbl_b].max()) * 1.05
+            fig  = px.scatter(pv, x=lbl_a, y=lbl_b,
+                              hover_name=_cc, color='delta',
+                              color_continuous_scale='RdYlGn_r',
+                              title=f'{_cl}: {lbl_a} → {lbl_b} (points below diagonal = improved)',
+                              labels={lbl_a: f'Mean ambiguity {lbl_a} (%)',
+                                      lbl_b: f'Mean ambiguity {lbl_b} (%)'})
+            fig.add_shape(type='line', x0=0, y0=0, x1=_lim, y1=_lim,
+                          line=dict(dash='dash', color='grey', width=1))
+            show_fig(fig, height=500)
+
+        # ── Summary table for last CDS stage ────────────────────────────────
+        _last_lbl, _last_df = cds_stages_data[-1]
+        ishow(_clade_summary(_last_df, _cc).rename(columns={
+                _cc: _cl, 'mean_ambig': 'Mean ambig (%)', 'median_ambig': 'Median ambig (%)',
+                'mean_genes': 'Mean genes/sp', 'median_genes': 'Median genes/sp', 'n_species': 'N species'}),
+              caption=f"CDS per-{_cl.lower()} summary ({_last_lbl})")
+
+    # ── Per-species wide table ───────────────────────────────────────────────
+    display(Markdown("#### Per-species"))
+    slug = lambda l: l.lower().replace('/', '_').replace(' ', '_')
+    if len(cds_stages_data) > 1:
+        first_lbl, first_df = cds_stages_data[0]
+        sp_wide = _species_summary(first_df).rename(columns={
+            'n_genes':      f'n_genes_{slug(first_lbl)}',
+            'mean_ambig':   f'mean_ambig_{slug(first_lbl)}',
+            'median_ambig': f'median_ambig_{slug(first_lbl)}'})
+        for lbl, df in cds_stages_data[1:]:
+            s = _species_summary(df)[['species', 'n_genes', 'mean_ambig', 'median_ambig']].rename(columns={
+                'n_genes':      f'n_genes_{slug(lbl)}',
+                'mean_ambig':   f'mean_ambig_{slug(lbl)}',
+                'median_ambig': f'median_ambig_{slug(lbl)}'})
+            sp_wide = sp_wide.merge(s, on='species', how='outer')
+        first_col = f'n_genes_{slug(first_lbl)}'
+        last_col  = f'n_genes_{slug(cds_stages_data[-1][0])}'
+        sp_wide['pct_genes_retained'] = (sp_wide[last_col] / sp_wide[first_col] * 100).round(1)
+        ishow(sp_wide.sort_values(first_col, ascending=False).reset_index(drop=True),
+              caption=f"Per-species CDS quality: {' → '.join(cds_available)}")
+    else:
+        _lbl, _df = cds_stages_data[0]
+        ishow(_species_summary(_df).rename(columns={
+                'n_genes': 'Gene count', 'mean_ambig': 'Mean ambig (%)', 'median_ambig': 'Median ambig (%)'}),
+              caption=f"Per-species CDS quality ({_lbl})")
+```
+
+### Protein
+
+```{python}
+#| label: clade-prot-plots
+#| echo: false
+
+if prot_seq_df.empty:
+    display(Markdown("*No protein data available.*"))
+else:
+    _ord_col = next((c for c in prot_seq_df.columns if 'order'  in c.lower()), None)
+    _fam_col = next((c for c in prot_seq_df.columns if 'family' in c.lower()), None)
+    _prot_lbl = f'PROT/{TRANSLATION_MODE}'
+
+    for _cc, _cl in [(_ord_col, 'Order'), (_fam_col, 'Family')]:
+        if not _cc:
+            continue
+        display(Markdown(f"#### By {_cl}"))
+        s = _clade_summary(prot_seq_df, _cc)
+
+        # ── Scatter: coverage vs ambiguity ───────────────────────────────────
+        fig = px.scatter(s, x='mean_genes', y='mean_ambig',
+                         size='n_species', hover_name=_cc,
+                         color='median_ambig', color_continuous_scale='RdYlGn_r',
+                         title=f'{_cl} quality ({_prot_lbl}): gene coverage vs residue ambiguity',
+                         labels={'mean_genes': 'Mean genes per species',
+                                 'mean_ambig': 'Mean ambiguity (%)'})
+        show_fig(fig, height=500)
+
+        # ── Bar: gene coverage coloured by ambiguity ─────────────────────────
+        top = s.head(30).sort_values('mean_genes')
+        fig2 = px.bar(top, x='mean_genes', y=_cc, orientation='h',
+                      color='mean_ambig', color_continuous_scale='RdYlGn_r',
+                      title=f'Mean gene count per {_cl.lower()} ({_prot_lbl}, top 30)',
+                      labels={'mean_genes': 'Mean gene count per species', 'mean_ambig': 'Mean ambig (%)'})
+        fig2.update_layout(height=max(400, len(top) * 22))
+        show_fig(fig2)
+
+        ishow(s.rename(columns={_cc: _cl, 'mean_ambig': 'Mean ambig (%)', 'median_ambig': 'Median ambig (%)',
+                                 'mean_genes': 'Mean genes/sp', 'median_genes': 'Median genes/sp',
+                                 'n_species': 'N species'}),
+              caption=f"Protein per-{_cl.lower()} quality ({_prot_lbl})")
+
+    # ── Per-species table ────────────────────────────────────────────────────
+    display(Markdown("#### Per-species"))
+    ishow(_species_summary(prot_seq_df).rename(columns={
+            'n_genes': 'Gene count', 'mean_ambig': 'Mean ambig (%)', 'median_ambig': 'Median ambig (%)'}),
+          caption=f"Per-species protein quality ({_prot_lbl})")
+```
+
+## Gene coverage table
+
+```{python}
+#| label: gene-table
+#| echo: false
+
+if not qual.empty:
+    preferred = ['gene', 'n_seqs', 'aln_len', 'completeness_pct',
+                 'mean_gap_pct', 'n_highgap', 'mean_ambig_pct']
+    display_cols = [c for c in preferred if c in qual.columns] or list(qual.columns)
+    sort_col = 'n_seqs' if 'n_seqs' in qual.columns else display_cols[0]
+    df_show = qual[display_cols].sort_values(sort_col, ascending=False)
+    ishow(df_show.reset_index(drop=True),
+          caption="Per-gene alignment quality (sorted by species count, descending)")
+else:
+    display(Markdown("*No quality data available.*"))
+```
+
+## Species coverage tree
+
+```{python}
+#| label: species-tree
+#| echo: false
+
+if not (SPECIES_TREE and Path(SPECIES_TREE).exists()):
+    display(Markdown("*Species tree not available — pass `--psel_species_tree`.*"))
+elif taxid.empty:
+    display(Markdown("*Species tree requires `TAXID_TSV` to annotate orders.*"))
+else:
+    try:
+        import toytree, toyplot, toyplot.html
+
+        tree = toytree.tree(SPECIES_TREE)
+        tip_names = tree.get_tip_labels()
+        tip_set   = set(tip_names)
+
+        # ── Build species → order mapping ────────────────────────────────────
+        sp_col  = next((c for c in taxid.columns if c.lower() == 'species'), None)
+        ord_col = next((c for c in taxid.columns if 'order'  in c.lower()), None)
+        fam_col = next((c for c in taxid.columns if 'family' in c.lower()), None)
+
+        if ord_col is None and fam_col and not fam_order_df.empty:
+            fo_fam = next((c for c in fam_order_df.columns if 'family' in c.lower()), None)
+            fo_ord = next((c for c in fam_order_df.columns if 'order'  in c.lower()), None)
+            if fo_fam and fo_ord:
+                taxid2 = taxid.merge(
+                    fam_order_df[[fo_fam, fo_ord]].rename(columns={fo_ord: '_order'}),
+                    left_on=fam_col, right_on=fo_fam, how='left'
+                )
+                ord_col = '_order'
+                taxid = taxid2
+
+        if sp_col is None or ord_col is None:
+            display(Markdown("*Could not resolve species → order mapping from taxid file.*"))
+        else:
+            tax = taxid[[sp_col, ord_col]].copy()
+            tax['_tip'] = tax[sp_col].str.replace(' ', '_', regex=False)
+            sp_to_order = tax.set_index('_tip')[ord_col].to_dict()
+
+            tip_orders = [sp_to_order.get(t, 'Unknown') for t in tip_names]
+
+            # ── Assign a colour to each order ────────────────────────────────
+            import matplotlib.colors as _mc
+            unique_orders = sorted(set(tip_orders))
+            _palette = (
+                px.colors.qualitative.T10
+                + px.colors.qualitative.Plotly
+                + px.colors.qualitative.Set3
+            )
+            order_color = {o: _palette[i % len(_palette)] for i, o in enumerate(unique_orders)}
+            tip_colors  = [order_color[o] for o in tip_orders]
+
+            # ── Find MRCA of each order for clade labels ─────────────────────
+            from collections import defaultdict
+            order_tips = defaultdict(list)
+            for tip, order in zip(tip_names, tip_orders):
+                order_tips[order].append(tip)
+
+            n_nodes = tree.nnodes
+            node_labels = [''] * n_nodes
+            try:
+                for order_name, tips_in_order in order_tips.items():
+                    present = [t for t in tips_in_order if t in tip_set]
+                    if len(present) >= 2:
+                        mrca = tree.get_mrca_node(*present)
+                        node_labels[mrca.idx] = order_name
+                    elif len(present) == 1:
+                        # Single-tip order: label the tip node itself
+                        idx = tip_names.index(present[0])
+                        node_labels[idx] = order_name
+            except Exception:
+                node_labels = [''] * n_nodes  # fallback: no labels
+
+            n_nodes  = tree.nnodes
+            node_col = tip_colors + ['rgba(0,0,0,0)'] * (n_nodes - len(tip_names))
+            node_sz  = [6] * len(tip_names) + [0] * (n_nodes - len(tip_names))
+
+            canvas, *_ = tree.draw(
+                layout='c',
+                edge_type='c',
+                tip_labels=False,
+                tip_labels_align=False,
+                node_colors=node_col,
+                node_sizes=node_sz,
+                node_labels=node_labels,
+                node_labels_style={"font-size": "8px", "fill": "#333333"},
+                width=750,
+                height=750,
+            )
+            toyplot.html.render(canvas, "phylo_species_coverage.html")
+            from IPython.display import HTML
+            display(HTML(open("phylo_species_coverage.html").read()))
+
+            # ── Order legend ─────────────────────────────────────────────────
+            legend_rows = "".join(
+                f'<span style="display:inline-block;margin:2px 6px;padding:2px 8px;'
+                f'background:{order_color[o]};border-radius:3px;font-size:12px">{o}</span>'
+                for o in sorted(unique_orders) if o != 'Unknown'
+            )
+            display(HTML(f"<div style='margin-top:8px'><b>Order colours:</b><br>{legend_rows}</div>"))
+
+    except ImportError:
+        display(Markdown("*toytree not installed — species tree skipped.*"))
+    except Exception as e:
+        display(Markdown(f"*Could not render species tree: {e}*"))
+```
