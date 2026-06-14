@@ -6,12 +6,21 @@ Reads PSEL/<gene>/<gene>.{FUBAR,FEL,MEME,SLAC}.json files, extracts key
 statistics, and optionally joins with gene_variability.tsv.
 
 Outputs (written to --out_dir):
-  fubar_results.tsv   One row per gene: n_pos_sites, max_posterior, mean_posterior
-  fubar_sites.tsv     One row per gene×site with posteriors (all sites)
+  fubar_results.tsv   One row per gene: n_pos_sites (posterior>=threshold),
+                      n_pos_sites_fdr (empirical Bayesian FDR), max/mean_posterior
+  fubar_sites.tsv     One row per gene×site; adds is_pos_hit_fdr (Bayesian FDR call)
   fel_results.tsv     One row per gene×site with dN/dS and p-values
-  meme_results.tsv    One row per gene×site with p-value and beta+
+  busted_results.tsv  One row per gene: busted_pval, busted_qval (BH-FDR), is_busted_sig
+  meme_results.tsv    One row per gene×site; adds testable (dS>0 & beta+ in-bound),
+                      meme_qval (BH-FDR over testable sites), is_meme_sig
+  meme_candidate_genes.txt  Gate for the MEME second pass (with --write_candidates):
+                      BUSTED-significant genes, or the FUBAR-FDR fallback
   sel_variability.tsv Join of fubar_results × gene_variability (if --fubar_tsv or FUBAR in --analyses,
                       and --variability_tsv provided)
+
+Multiple-testing model: FUBAR is Bayesian (empirical Bayesian FDR, not BH);
+BUSTED and MEME are frequentist (Benjamini-Hochberg). MEME sites with dS==0 or
+beta+ at the optimiser boundary are excluded before FDR as degenerate.
 
 Usage:
   python aggregate_positive_selection.py \
@@ -250,6 +259,80 @@ def parse_slac(json_path):
 
 
 # ---------------------------------------------------------------------------
+# BUSTED parser (gene-level episodic selection test)
+# ---------------------------------------------------------------------------
+
+def parse_busted(json_path):
+    """Return the gene-level LRT p-value for episodic diversifying selection
+    from a BUSTED JSON, or None on failure."""
+    try:
+        with open(json_path) as fh:
+            d = json.load(fh)
+    except Exception as e:
+        print(f'WARN {json_path}: {e}', file=sys.stderr)
+        return None
+    try:
+        # HyPhy BUSTED stores the LRT p-value under d['test results']['p-value']
+        return float(d['test results']['p-value'])
+    except (KeyError, TypeError, ValueError) as e:
+        print(f'WARN {json_path}: BUSTED parse error — {e}', file=sys.stderr)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Multiple-testing helpers
+# ---------------------------------------------------------------------------
+
+def bh_fdr(pvals):
+    """Benjamini-Hochberg q-values for *pvals*, returned aligned to input order.
+
+    Frequentist FDR — use for p-value methods (BUSTED gene tests, MEME sites).
+    """
+    n = len(pvals)
+    if n == 0:
+        return []
+    order = sorted(range(n), key=lambda i: pvals[i])
+    q = [1.0] * n
+    prev = 1.0
+    # walk ranks high→low so the step-up monotonicity holds
+    for rank in range(n, 0, -1):
+        i = order[rank - 1]
+        prev = min(prev, pvals[i] * n / rank)
+        q[i] = prev
+    return q
+
+
+def bayesian_fdr_cutoff(posteriors, target_fdr):
+    """Empirical Bayesian FDR cutoff for FUBAR-style posteriors.
+
+    FUBAR is Bayesian and has no p-values, so BH is inappropriate. For a set of
+    called sites the expected FDR is mean(1 - posterior). Calling the highest-
+    posterior sites first, that running mean is non-decreasing, so the largest
+    set with realised FDR <= target is a prefix. Returns the posterior cutoff t;
+    sites with posterior >= t are called. Returns 1.0 (no calls) if even the top
+    site fails the target.
+    """
+    if not posteriors:
+        return 1.0
+    s = sorted(posteriors, reverse=True)
+    cum = 0.0
+    cutoff = 1.0
+    for k, p in enumerate(s, 1):
+        cum += (1.0 - p)
+        if cum / k <= target_fdr:
+            cutoff = p
+        else:
+            break
+    return cutoff
+
+
+# MEME per-site degeneracy guards: dS collapsing to 0 makes beta+ > dS trivially
+# true (saturation artifact), and beta+ pinned at the optimiser bound is
+# unidentifiable. Both are dropped before FDR so they cannot manufacture hits.
+MEME_BETA_BOUNDARY = 1e5
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -263,6 +346,16 @@ def main():
     parser.add_argument('--out_dir', required=True, help='Output directory for TSVs')
     parser.add_argument('--fubar_threshold', type=float, default=0.9,
                         help='Posterior probability threshold for FUBAR positive site (default: 0.9)')
+    parser.add_argument('--fubar_fdr', type=float, default=0.05,
+                        help='Target empirical Bayesian FDR for FUBAR site calls (default: 0.05)')
+    parser.add_argument('--meme_fdr', type=float, default=0.05,
+                        help='Target BH-FDR for MEME site calls, after dS>0 / boundary filtering (default: 0.05)')
+    parser.add_argument('--busted_fdr', type=float, default=0.05,
+                        help='Target BH-FDR for the gene-level BUSTED gate (default: 0.05)')
+    parser.add_argument('--meme_min_sites', type=int, default=1,
+                        help='Fallback MEME gate when BUSTED is absent: min FUBAR-FDR sites per gene (default: 1)')
+    parser.add_argument('--write_candidates', action='store_true',
+                        help='Write meme_candidate_genes.txt (BUSTED-FDR genes, or FUBAR fallback)')
     parser.add_argument('--fubar_tsv', default=None,
                         help='Pre-computed fubar_results.tsv to use for sel_variability join '
                              '(skips re-parsing FUBAR JSONs; used in AGGREGATE_FINAL)')
@@ -284,38 +377,57 @@ def main():
     # ── FUBAR ─────────────────────────────────────────────────────────────────
     if 'FUBAR' in analyses:
         fubar_rows = []
-        fubar_site_path = os.path.join(args.out_dir, 'fubar_sites.tsv')
-        n_site_rows = 0
+        # Buffer site rows so the genome-wide Bayesian-FDR cutoff can be computed
+        # before writing the per-site is_pos_hit_fdr column. At ~16k genes this is
+        # a few GB on the aggregation node; acceptable for a once-per-run step.
+        buffered = []          # (gene, site, dS, dN, prob_pos, prob_neg, is_pos_hit, is_neg_hit, map_cols)
+        all_pos_post = []      # genome-wide prob_pos for the FDR cutoff
+        for gene in genes:
+            jp = os.path.join(args.psel_dir, gene, f'{gene}.FUBAR.json')
+            if not os.path.isfile(jp):
+                continue
+            summary, sites = parse_fubar(jp, threshold=args.fubar_threshold)
+            if summary is not None:
+                fubar_rows.append({'gene': gene, **summary})
+            gene_map = load_gene_map(args.map_dir, gene) if args.map_dir else {}
+            for s in sites:
+                map_cols = ''
+                if args.map_dir:
+                    ori_col, hg38_aa, hg38_nt = gene_map.get(s['site'], ('NA', 'NA', 'NA'))
+                    map_cols = f'\t{ori_col}\t{hg38_aa}\t{hg38_nt}'
+                buffered.append((gene, s['site'], s['dS'], s['dN'], s['prob_pos'],
+                                 s['prob_neg'], int(s['is_pos_hit']), int(s['is_neg_hit']),
+                                 map_cols))
+                all_pos_post.append(s['prob_pos'])
 
+        # Genome-wide empirical Bayesian FDR cutoff (Bayesian, not BH).
+        fdr_cutoff = bayesian_fdr_cutoff(all_pos_post, args.fubar_fdr)
+        n_pos_fdr_per_gene = {}
+
+        fubar_site_path = os.path.join(args.out_dir, 'fubar_sites.tsv')
         map_cols_header = '\tori_codon_col\thg38_aa_pos\thg38_nt_coord' if args.map_dir else ''
         with open(fubar_site_path, 'w') as sfh:
-            sfh.write(f'gene\tsite\tdS\tdN\tprob_pos\tprob_neg\tis_pos_hit\tis_neg_hit{map_cols_header}\n')
-            for gene in genes:
-                jp = os.path.join(args.psel_dir, gene, f'{gene}.FUBAR.json')
-                if not os.path.isfile(jp):
-                    continue
-                summary, sites = parse_fubar(jp, threshold=args.fubar_threshold)
-                if summary is not None:
-                    fubar_rows.append({'gene': gene, **summary})
-                gene_map = load_gene_map(args.map_dir, gene) if args.map_dir else {}
-                for s in sites:
-                    map_cols = ''
-                    if args.map_dir:
-                        ori_col, hg38_aa, hg38_nt = gene_map.get(s['site'], ('NA', 'NA', 'NA'))
-                        map_cols = f'\t{ori_col}\t{hg38_aa}\t{hg38_nt}'
-                    sfh.write(f"{gene}\t{s['site']}\t{s['dS']}\t{s['dN']}\t"
-                              f"{s['prob_pos']}\t{s['prob_neg']}\t"
-                              f"{int(s['is_pos_hit'])}\t{int(s['is_neg_hit'])}{map_cols}\n")
-                    n_site_rows += 1
+            sfh.write(f'gene\tsite\tdS\tdN\tprob_pos\tprob_neg\tis_pos_hit\tis_pos_hit_fdr\tis_neg_hit{map_cols_header}\n')
+            for (gene, site, dS, dN, pp, pn, is_pos, is_neg, map_cols) in buffered:
+                is_pos_fdr = int(pp >= fdr_cutoff)
+                if is_pos_fdr:
+                    n_pos_fdr_per_gene[gene] = n_pos_fdr_per_gene.get(gene, 0) + 1
+                sfh.write(f"{gene}\t{site}\t{dS}\t{dN}\t{pp}\t{pn}\t"
+                          f"{is_pos}\t{is_pos_fdr}\t{is_neg}{map_cols}\n")
 
         fubar_path = os.path.join(args.out_dir, 'fubar_results.tsv')
         with open(fubar_path, 'w') as fh:
-            fh.write('gene\tn_pos_sites\tn_neg_sites\tmax_posterior\tmean_posterior\n')
+            fh.write('gene\tn_pos_sites\tn_pos_sites_fdr\tn_neg_sites\tmax_posterior\tmean_posterior\n')
             for r in sorted(fubar_rows, key=lambda x: -x['n_pos_sites']):
-                fh.write(f"{r['gene']}\t{r['n_pos_sites']}\t{r['n_neg_sites']}\t"
+                n_fdr = n_pos_fdr_per_gene.get(r['gene'], 0)
+                r['n_pos_sites_fdr'] = n_fdr
+                fh.write(f"{r['gene']}\t{r['n_pos_sites']}\t{n_fdr}\t{r['n_neg_sites']}\t"
                          f"{r['max_posterior']}\t{r['mean_posterior']}\n")
+        n_genes_fdr = sum(1 for r in fubar_rows if r['n_pos_sites_fdr'] > 0)
         print(f'Written: {fubar_path} ({len(fubar_rows)} genes)', flush=True)
-        print(f'Written: {fubar_site_path} ({n_site_rows} gene×site rows)', flush=True)
+        print(f'Written: {fubar_site_path} ({len(buffered)} gene×site rows)', flush=True)
+        print(f'FUBAR Bayesian FDR {args.fubar_fdr}: posterior cutoff {fdr_cutoff:.4f}, '
+              f'{sum(n_pos_fdr_per_gene.values())} sites in {n_genes_fdr} genes', flush=True)
 
         # ── Join with variability ────────────────────────────────────────────
         if args.variability_tsv and os.path.isfile(args.variability_tsv):
@@ -363,25 +475,49 @@ def main():
 
     # ── MEME ──────────────────────────────────────────────────────────────────
     if 'MEME' in analyses:
+        # Buffer all sites: BH-FDR needs the full p-value set, and we only test
+        # sites that survive the dS>0 / beta+ boundary guards (saturation and
+        # unidentifiable estimates would otherwise manufacture significant calls).
+        meme_rows = []   # dicts with gene, site, dS, beta+, p+, p_meme, map_cols, testable
+        for gene in genes:
+            jp = os.path.join(args.psel_dir, gene, f'{gene}.MEME.json')
+            if not os.path.isfile(jp):
+                continue
+            gene_map = load_gene_map(args.map_dir, gene) if args.map_dir else {}
+            for row in parse_meme(jp):
+                map_cols = ''
+                if args.map_dir:
+                    ori_col, hg38_aa, hg38_nt = gene_map.get(row['site'], ('NA', 'NA', 'NA'))
+                    map_cols = f'\t{ori_col}\t{hg38_aa}\t{hg38_nt}'
+                row['gene'] = gene
+                row['map_cols'] = map_cols
+                row['testable'] = (row['dS'] > 0.0 and row['beta+'] < MEME_BETA_BOUNDARY)
+                meme_rows.append(row)
+
+        # BH-FDR across the testable sites only.
+        testable = [r for r in meme_rows if r['testable']]
+        qvals = bh_fdr([r['p_meme'] for r in testable])
+        for r, q in zip(testable, qvals):
+            r['meme_qval'] = round(q, 6)
+        for r in meme_rows:
+            if not r['testable']:
+                r['meme_qval'] = 'NA'
+            r['is_meme_sig'] = int(r['testable'] and r['meme_qval'] != 'NA'
+                                   and r['meme_qval'] <= args.meme_fdr)
+
         meme_path = os.path.join(args.out_dir, 'meme_results.tsv')
-        n_rows = 0
         map_cols_header = '\tori_codon_col\thg38_aa_pos\thg38_nt_coord' if args.map_dir else ''
         with open(meme_path, 'w') as fh:
-            fh.write(f'gene\tsite\tdS\tbeta+\tp+\tp_meme{map_cols_header}\n')
-            for gene in genes:
-                jp = os.path.join(args.psel_dir, gene, f'{gene}.MEME.json')
-                if not os.path.isfile(jp):
-                    continue
-                gene_map = load_gene_map(args.map_dir, gene) if args.map_dir else {}
-                for row in parse_meme(jp):
-                    map_cols = ''
-                    if args.map_dir:
-                        ori_col, hg38_aa, hg38_nt = gene_map.get(row['site'], ('NA', 'NA', 'NA'))
-                        map_cols = f'\t{ori_col}\t{hg38_aa}\t{hg38_nt}'
-                    fh.write(f"{gene}\t{row['site']}\t{row['dS']}\t{row['beta+']}\t"
-                             f"{row['p+']}\t{row['p_meme']}{map_cols}\n")
-                    n_rows += 1
-        print(f'Written: {meme_path} ({n_rows} gene×site rows)', flush=True)
+            fh.write(f'gene\tsite\tdS\tbeta+\tp+\tp_meme\ttestable\tmeme_qval\tis_meme_sig{map_cols_header}\n')
+            for r in meme_rows:
+                fh.write(f"{r['gene']}\t{r['site']}\t{r['dS']}\t{r['beta+']}\t"
+                         f"{r['p+']}\t{r['p_meme']}\t{int(r['testable'])}\t"
+                         f"{r['meme_qval']}\t{r['is_meme_sig']}{r['map_cols']}\n")
+        n_sig = sum(r['is_meme_sig'] for r in meme_rows)
+        n_drop = sum(1 for r in meme_rows if not r['testable'])
+        print(f'Written: {meme_path} ({len(meme_rows)} gene×site rows; '
+              f'{len(testable)} testable, {n_drop} dropped by guards; '
+              f'{n_sig} significant at BH-FDR {args.meme_fdr})', flush=True)
 
     # ── SLAC ──────────────────────────────────────────────────────────────────
     if 'SLAC' in analyses:
@@ -403,6 +539,49 @@ def main():
                     fh.write(f"{gene}\t{row['site']}\t{row['dS']}\t{row['dN']}\t{row['p_slac+']}{map_cols}\n")
                     n_rows += 1
         print(f'Written: {slac_path} ({n_rows} gene×site rows)', flush=True)
+
+    # ── BUSTED (gene-level gate) ───────────────────────────────────────────────
+    busted_sig_genes = None
+    if 'BUSTED' in analyses:
+        busted = []   # (gene, pval)
+        for gene in genes:
+            jp = os.path.join(args.psel_dir, gene, f'{gene}.BUSTED.json')
+            if not os.path.isfile(jp):
+                continue
+            pv = parse_busted(jp)
+            if pv is not None:
+                busted.append((gene, pv))
+
+        qvals = bh_fdr([p for _, p in busted])
+        busted_path = os.path.join(args.out_dir, 'busted_results.tsv')
+        busted_sig_genes = []
+        with open(busted_path, 'w') as fh:
+            fh.write('gene\tbusted_pval\tbusted_qval\tis_busted_sig\n')
+            for (gene, pv), q in sorted(zip(busted, qvals), key=lambda x: x[1]):
+                sig = int(q <= args.busted_fdr)
+                if sig:
+                    busted_sig_genes.append(gene)
+                fh.write(f'{gene}\t{pv:.6g}\t{q:.6f}\t{sig}\n')
+        print(f'Written: {busted_path} ({len(busted)} genes; '
+              f'{len(busted_sig_genes)} significant at BH-FDR {args.busted_fdr})', flush=True)
+
+    # ── MEME candidate genes (gate for the second pass) ────────────────────────
+    if args.write_candidates:
+        cand_path = os.path.join(args.out_dir, 'meme_candidate_genes.txt')
+        if busted_sig_genes is not None:
+            candidates = busted_sig_genes
+            gate = f'BUSTED BH-FDR <= {args.busted_fdr}'
+        else:
+            # Fallback when BUSTED was not run: genes with >= meme_min_sites
+            # FUBAR-FDR positive sites (n_pos_sites_fdr from the FUBAR block).
+            candidates = [r['gene'] for r in fubar_rows
+                          if r.get('n_pos_sites_fdr', 0) >= args.meme_min_sites] \
+                         if 'FUBAR' in analyses else []
+            gate = f'FUBAR n_pos_sites_fdr >= {args.meme_min_sites}'
+        with open(cand_path, 'w') as fh:
+            if candidates:
+                fh.write('\n'.join(str(g) for g in candidates) + '\n')
+        print(f'Written: {cand_path} ({len(candidates)} candidates; gate: {gate})', flush=True)
 
     # ── sel_variability from pre-computed FUBAR tsv ───────────────────────────
     # Used in AGGREGATE_FINAL where FUBAR JSONs are not available but

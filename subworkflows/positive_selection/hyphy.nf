@@ -89,9 +89,10 @@ process HYPHY_BATCH {
     tuple val(batch_id), val(manifest_text), path(fastas), path(trees)
 
     output:
-    tuple val(batch_id), path("*.FUBAR.json"), optional: true, emit: fubar_json
-    tuple val(batch_id), path("*.FEL.json"),   optional: true, emit: fel_json
-    tuple val(batch_id), path("*.SLAC.json"),  optional: true, emit: slac_json
+    tuple val(batch_id), path("*.FUBAR.json"),  optional: true, emit: fubar_json
+    tuple val(batch_id), path("*.FEL.json"),    optional: true, emit: fel_json
+    tuple val(batch_id), path("*.SLAC.json"),   optional: true, emit: slac_json
+    tuple val(batch_id), path("*.BUSTED.json"), optional: true, emit: busted_json
 
     script:
     def workers   = params.psel_batch_workers as int
@@ -124,6 +125,7 @@ process AGGREGATE_FIRST_PASS {
     path "fubar_results.tsv",        emit: fubar_tsv
     path "fubar_sites.tsv",          optional: true, emit: fubar_sites
     path "fel_results.tsv",          optional: true, emit: fel_tsv
+    path "busted_results.tsv",       optional: true, emit: busted_tsv
     path "meme_candidate_genes.txt", emit: meme_candidates
 
     script:
@@ -134,8 +136,9 @@ process AGGREGATE_FIRST_PASS {
     # Arrange flat JSONs into PSEL/<gene>/ structure expected by aggregate script
     python3 - <<'PYEOF'
 import os, glob, re
-for f in glob.glob("*.FUBAR.json") + glob.glob("*.FEL.json") + glob.glob("*.SLAC.json"):
-    m = re.match(r'^(.+?)\\.(?:FUBAR|FEL|SLAC)\\.json\$', f)
+for f in (glob.glob("*.FUBAR.json") + glob.glob("*.FEL.json")
+          + glob.glob("*.SLAC.json") + glob.glob("*.BUSTED.json")):
+    m = re.match(r'^(.+?)\\.(?:FUBAR|FEL|SLAC|BUSTED)\\.json\$', f)
     if m:
         gene = m.group(1)
         os.makedirs(f"PSEL/{gene}", exist_ok=True)
@@ -150,33 +153,23 @@ PYEOF
     map_arg=""
     [[ -n "\$(ls MAP/*.map.tsv 2>/dev/null)" ]] && map_arg="--map_dir MAP"
 
+    # Aggregate FUBAR/BUSTED and write meme_candidate_genes.txt
+    # (BUSTED-FDR gate, or FUBAR-FDR fallback when BUSTED is absent).
     python3 ${projectDir}/subworkflows/positive_selection/local/aggregate_positive_selection.py \\
         --psel_dir         PSEL \\
         --analyses         "${methods}" \\
         --out_dir          . \\
         --fubar_threshold  ${threshold} \\
+        --fubar_fdr        ${params.fubar_fdr} \\
+        --busted_fdr       ${params.busted_fdr} \\
+        --meme_fdr         ${params.meme_fdr} \\
+        --meme_min_sites   ${params.meme_min_sites} \\
+        --write_candidates \\
         \${map_arg} \\
         ${var_arg}
 
-    # Write meme candidate genes (genes with positive FUBAR sites)
-    python3 - <<'PYEOF'
-import pandas as pd, sys, os
-fubar_f = "fubar_results.tsv"
-meme_f  = "meme_candidate_genes.txt"
-min_sites = int(${params.meme_min_sites})
-if os.path.exists(fubar_f):
-    df = pd.read_csv(fubar_f, sep='\\t')
-    col = next((c for c in df.columns if 'n_pos' in c.lower() or 'pos_sites' in c.lower()), None)
-    gene_col = next((c for c in df.columns if 'gene' in c.lower()), df.columns[0])
-    if col:
-        candidates = df[df[col] >= min_sites][gene_col].tolist()
-        with open(meme_f, 'w') as fh:
-            fh.write('\\n'.join(str(g) for g in candidates) + '\\n')
-    else:
-        open(meme_f, 'w').close()
-else:
-    open(meme_f, 'w').close()
-PYEOF
+    # Guarantee the candidate file exists even if no gene passed the gate
+    [[ -f meme_candidate_genes.txt ]] || touch meme_candidate_genes.txt
     """
 }
 
@@ -191,8 +184,9 @@ process HYPHY_MEME_BATCH {
     tuple val(batch_id), path("*.MEME.json"), optional: true, emit: meme_json
 
     script:
-    def workers  = params.psel_batch_workers as int
-    def cpu_each = Math.max(1, (task.cpus as int).intdiv(workers))
+    def workers   = params.psel_batch_workers as int
+    def cpu_each  = Math.max(1, (task.cpus as int).intdiv(workers))
+    def taxid_arg = params.taxid_tsv ? "--taxid-tsv '${params.taxid_tsv}'" : ''
     """
     cat > manifest.tsv << 'MANIFEST_EOF'
 ${manifest_text}
@@ -203,7 +197,8 @@ MANIFEST_EOF
         --workers     ${workers} \\
         --cpu-each    ${cpu_each} \\
         --methods     "MEME" \\
-        --scripts-dir "${projectDir}/subworkflows/positive_selection/local"
+        --scripts-dir "${projectDir}/subworkflows/positive_selection/local" \\
+        ${taxid_arg}
     """
 }
 
@@ -249,6 +244,7 @@ PYEOF
         --analyses        "MEME" \\
         --out_dir         . \\
         --fubar_tsv       ${fubar_tsv} \\
+        --meme_fdr        ${params.meme_fdr} \\
         \${map_arg} \\
         ${var_arg}
 
@@ -336,6 +332,7 @@ workflow HYPHY {
     all_first_pass_json = HYPHY_BATCH.out.fubar_json.collect { it[1] }.flatten()
         .mix(HYPHY_BATCH.out.fel_json.collect { it[1] }.flatten())
         .mix(HYPHY_BATCH.out.slac_json.collect { it[1] }.flatten().ifEmpty([]))
+        .mix(HYPHY_BATCH.out.busted_json.collect { it[1] }.flatten().ifEmpty([]))
         .collect()
 
     // Collect all map TSVs as a flat list of files (empty list if no maps provided)
@@ -360,8 +357,14 @@ workflow HYPHY {
     meme_batches_ch = make_psel_batches(meme_input, 'meme', batch_size)
     HYPHY_MEME_BATCH( meme_batches_ch )
 
+    // Canonical empty-safe collection: when no gene yields a MEME JSON the
+    // channel must still emit [] so AGGREGATE_FINAL fires (and produces
+    // sel_variability.tsv) instead of starving and never running.
     all_meme_json = HYPHY_MEME_BATCH.out.meme_json
-        .collect { it[1] }.flatten().ifEmpty([]).collect()
+        .map { it[1] }
+        .flatten()
+        .collect()
+        .ifEmpty([])
 
     AGGREGATE_FINAL(
         AGGREGATE_FIRST_PASS.out.fubar_tsv,
@@ -374,6 +377,7 @@ workflow HYPHY {
     fubar_tsv           = AGGREGATE_FIRST_PASS.out.fubar_tsv
     fubar_sites         = AGGREGATE_FIRST_PASS.out.fubar_sites.ifEmpty(file('NO_FUBAR_SITES'))
     fel_tsv             = AGGREGATE_FIRST_PASS.out.fel_tsv.ifEmpty(file('NO_FEL'))
+    busted_tsv          = AGGREGATE_FIRST_PASS.out.busted_tsv.ifEmpty(file('NO_BUSTED'))
     meme_tsv            = AGGREGATE_FINAL.out.meme_tsv.ifEmpty(file('NO_MEME'))
     sel_variability_tsv = AGGREGATE_FINAL.out.sel_variability.ifEmpty(file('NO_SEL_VAR'))
 }
