@@ -97,11 +97,7 @@ process MAP_DOMAIN_VARIABILITY {
     path "domain_variability.tsv", emit: domain_variability
 
     script:
-    // map_domain_variability.py:
-    //   --var_dir      PROT_VAR_RAW/ (entropy TSVs)
-    //   --prot_raw_dir PROT_RAW/     (protein FASTAs)
-    //   --hmmscan_domtblout
-    //   --out_tsv
+    def clans_arg = params.pfam_clans_tsv ? "--pfam_clans_tsv ${params.pfam_clans_tsv}" : ''
     """
     mkdir -p PROT_VAR_RAW PROT_RAW
     # Move staged entropy TSVs and protein FASTAs into expected subdirs
@@ -112,7 +108,8 @@ process MAP_DOMAIN_VARIABILITY {
         --var_dir           PROT_VAR_RAW \\
         --prot_raw_dir      PROT_RAW \\
         --hmmscan_domtblout "${domtblout}" \\
-        --out_tsv           domain_variability.tsv
+        --out_tsv           domain_variability.tsv \\
+        ${clans_arg}
     """
 }
 

@@ -23,6 +23,8 @@ listed in a dedicated zero-annotation report.
 import argparse
 import csv
 import os
+import sys
+from pathlib import Path
 from Bio import AlignIO
 from Bio.Align import MultipleSeqAlignment
 
@@ -47,8 +49,21 @@ def load_dedup_map(tsv_path: str) -> dict[str, str]:
 
 
 def load_metadata(tsv_path: str) -> dict[str, dict]:
+    path = Path(tsv_path)
+    if not path.is_file():
+        if str(tsv_path).strip().lower() in {"", "true", "false"}:
+            fallback = Path(__file__).resolve().parents[3] / "taxa_info" / "assemblies_and_species_mammals.tsv"
+            if fallback.is_file():
+                print(
+                    f"WARNING: --metadata was {tsv_path!r}; using {fallback}",
+                    file=sys.stderr,
+                )
+                path = fallback
+        if not path.is_file():
+            raise FileNotFoundError(f"Metadata TSV not found: {tsv_path}")
+
     meta: dict[str, dict] = {}
-    with open(tsv_path, newline="", encoding="utf-8") as fh:
+    with open(path, newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh, delimiter="\t")
         for row in reader:
             asm = row["Assembly name"].strip()
@@ -145,7 +160,7 @@ def main():
     parser.add_argument("-m", "--metadata",    required=True,
                         help="assemblies_and_species_mammals.tsv")
     parser.add_argument("--gene_counts",       required=True,
-                        help="TSV from count_assembly_genes.py (assembly_name, n_genes)")
+                        help="TSV from count_genes.py (assembly_name, n_genes)")
     parser.add_argument("--dedup_map",         required=True,
                         help="TSV mapping assembly_name -> canonical_group (species_dedup_map.tsv)")
     parser.add_argument("--report",            default=None,

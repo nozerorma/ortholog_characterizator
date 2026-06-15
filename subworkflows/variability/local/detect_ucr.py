@@ -107,29 +107,56 @@ def detect_absolute(gene, rows, threshold, min_len, max_gap, flank_size):
     return ucrs
 
 
-def detect_relative(gene, rows, zscore_thresh, min_len, flank_size):
+def detect_relative(gene, rows, zscore_thresh, min_len, flank_size,
+                    window_size, max_pos_gap):
     """
-    Consecutive positions with C_trident z-score >= zscore_thresh (within-gene).
-    Returns empty list for uniformly conserved genes (std < 1e-10).
+    Locally conserved islands: sliding windows whose mean C_trident is unusually
+    high *relative to the gene's other windows* (z-score over the distribution of
+    window means >= zscore_thresh). Overlapping qualifying windows are merged.
+
+    Scoring the z-score on window means rather than individual positions makes the
+    method self-calibrating: any gene with non-uniform conservation yields hits at
+    its most-conserved stretches, instead of the per-position variant which almost
+    never produced ≥min_len consecutive positions above the threshold.
+
+    Returns empty for uniformly conserved genes (window-mean std < 1e-10).
     """
-    if len(rows) < 3:
+    n = len(rows)
+    if n < window_size or n < 3:
         return []
-    vals  = [p['C_trident'] for p in rows]
-    mean_c = sum(vals) / len(vals)
-    std_c  = math.sqrt(sum((v - mean_c) ** 2 for v in vals) / len(vals))
-    if std_c < 1e-10:
+
+    # Mean C_trident of every gap-acceptable window, keyed by start index.
+    win_starts, win_means = [], []
+    for i in range(n - window_size + 1):
+        win = rows[i:i + window_size]
+        if all(p['g'] <= max_pos_gap for p in win):
+            win_starts.append(i)
+            win_means.append(sum(p['C_trident'] for p in win) / window_size)
+
+    if len(win_means) < 3:
         return []
+    mu  = sum(win_means) / len(win_means)
+    sd  = math.sqrt(sum((m - mu) ** 2 for m in win_means) / len(win_means))
+    if sd < 1e-10:
+        return []
+
+    covered = [False] * n
+    for start, m in zip(win_starts, win_means):
+        if (m - mu) / sd >= zscore_thresh:
+            for j in range(start, start + window_size):
+                covered[j] = True
+
     ucrs, counter, run = [], 1, []
-    for p in rows:
-        if (p['C_trident'] - mean_c) / std_c >= zscore_thresh:
-            run.append(p)
+    for i, ok in enumerate(covered):
+        if ok:
+            run.append(rows[i])
         else:
             if len(run) >= min_len:
-                ucrs.append(_make(gene, 'relative', counter, run, len(rows), flank_size))
+                ucrs.append(_make(gene, 'relative', counter, run, n, flank_size))
                 counter += 1
             run = []
     if len(run) >= min_len:
-        ucrs.append(_make(gene, 'relative', counter, run, len(rows), flank_size))
+        ucrs.append(_make(gene, 'relative', counter, run, n, flank_size))
     return ucrs
 
 
@@ -214,7 +241,7 @@ def main():
         detect_absolute(args.gene, rows, args.abs_threshold, args.abs_min_len,
                         args.abs_max_gap, args.flank_size)
         + detect_relative(args.gene, rows, args.rel_zscore, args.rel_min_len,
-                          args.flank_size)
+                          args.flank_size, args.window_size, args.window_max_pos_gap)
         + detect_sliding(args.gene, rows, args.window_size, args.window_threshold,
                          args.window_max_pos_gap, args.flank_size)
     )

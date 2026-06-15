@@ -4,24 +4,6 @@ nextflow.enable.dsl = 2
 
 // ── Processes ─────────────────────────────────────────────────────────────────
 
-process COUNT_ASSEMBLY_GENES {
-    label 'process_medium'
-    publishDir "${params.out_dir}/quality/gene_counts", mode: 'copy'
-
-    input:
-    path fastas  // collected fasta files staged in work dir
-
-    output:
-    path "gene_counts.tsv", emit: gene_counts
-
-    script:
-    """
-    python3 ${projectDir}/subworkflows/quality/local/count_assembly_genes.py \\
-        --dir    "." \\
-        --output gene_counts.tsv
-    """
-}
-
 process DEDUP_BATCH {
     label 'process_batch_light'
     publishDir "${params.out_dir}/quality/dedup_logs", mode: 'copy', pattern: '*.dedup.log',        saveAs: { it.replace('.dedup.log', '.log') }
@@ -82,13 +64,9 @@ workflow DEDUP {
 
     take:
     cds_ch   // tuple(gene_id, fasta)
+    gene_counts_ch
 
     main:
-
-    // Collect only the (potentially sampled) fasta files so COUNT_ASSEMBLY_GENES
-    // sees the same gene pool used downstream, not the full CDS directory.
-    cds_files_ch = cds_ch.map { gene_id, fa -> fa }.collect()
-    COUNT_ASSEMBLY_GENES( cds_files_ch )
 
     // Build batches: collate N genes, create manifest + file list
     def batch_size = (params.dedup_batch_size ?: 500) as int
@@ -102,8 +80,8 @@ workflow DEDUP {
             tuple(batch_id, manifest_text, fastas)
         }
 
-    // Combine each batch with the gene_counts file
-    batches_with_counts = batches_ch.combine(COUNT_ASSEMBLY_GENES.out.gene_counts)
+    // Combine each batch with the precomputed gene_counts file
+    batches_with_counts = batches_ch.combine(gene_counts_ch)
 
     DEDUP_BATCH( batches_with_counts )
 

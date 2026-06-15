@@ -159,6 +159,33 @@ def _prefix(d: dict | None, stage: str) -> dict:
     return {f"{stage}_{k}": v for k, v in d.items()}
 
 
+_STAGE_SUFFIXES = ('.prot', '.trim', '.dedup', '.filtered')
+
+
+def _base_gene(name: str) -> str:
+    """Canonical gene id from a stage FASTA filename, ignoring stage extensions
+    (e.g. 'ENST….codonified.prot.fa' and 'ENST….codonified.fa' → same id)."""
+    stem = name[:-3] if name.endswith('.fa') else name
+    for suf in _STAGE_SUFFIXES:
+        if stem.endswith(suf):
+            return stem[:-len(suf)]
+    return stem
+
+
+def codon_cols_by_gene(dirpath: str | None) -> dict:
+    """Map base gene id → codon-column count for a stage directory. Reads only
+    the first record per file (aligned sequences share one length)."""
+    p = Path(dirpath) if dirpath else None
+    if not p or not p.is_dir():
+        return {}
+    out = {}
+    for fa in sorted(p.glob('*.fa')):
+        rec = next(SeqIO.parse(fa, 'fasta'), None)
+        if rec is not None:
+            out[_base_gene(fa.name)] = len(rec.seq) // 3
+    return out
+
+
 def process_gene(fa_path: Path, out_dir: Path, has_prefilter: bool) -> dict:
     """Collect statistics for one gene across all pipeline stages."""
     gene_stem = fa_path.stem      # e.g. ENST00000001008.6#FKBP4.codonified
@@ -270,6 +297,12 @@ def main():
                         help='Output prefix (e.g. reports/quality)')
     parser.add_argument('--gene_list', default=None,
                         help='Optional file: one gene/filename fragment per line')
+    parser.add_argument('--trim_dir', default=None,
+                        help='Explicit BMGE-trimmed codon dir (overrides out_dir/TRIM lookup '
+                             'for the trim-column derivation)')
+    parser.add_argument('--pretrim_dir', default=None,
+                        help='BMGE input codon dir (PREFILTER, else DEDUP) used as the baseline '
+                             'for trim_cols_removed / trim_pct_cols_kept')
     args = parser.parse_args()
 
     align_dir = Path(args.align_dir)
@@ -291,6 +324,28 @@ def main():
     rows = [process_gene(fa, out_dir, has_prefilter) for fa in fa_files]
 
     per_gene_df = pd.DataFrame(rows)
+
+    # ── BMGE trim columns from explicit stage dirs ───────────────────────────
+    # The per-stage subdirs are usually not staged alongside this process, so
+    # the out_dir/TRIM lookup in process_gene yields nothing. When the published
+    # TRIM and BMGE-input (PREFILTER/DEDUP) dirs are passed explicitly, derive
+    # the codon-level trim columns here by matching base gene id.
+    if args.trim_dir and args.pretrim_dir and not per_gene_df.empty:
+        trim_len = codon_cols_by_gene(args.trim_dir)
+        pre_len  = codon_cols_by_gene(args.pretrim_dir)
+        if trim_len and pre_len:
+            base = per_gene_df['gene'].map(_base_gene)
+            trim_s = base.map(trim_len)
+            pre_s  = base.map(pre_len)
+            per_gene_df['trim_aln_len']      = trim_s
+            per_gene_df['trim_cols_removed'] = (pre_s - trim_s)
+            per_gene_df['trim_pct_cols_kept'] = (trim_s / pre_s * 100).round(2)
+            n_ok = int(per_gene_df['trim_pct_cols_kept'].notna().sum())
+            print(f"  BMGE trim columns derived for {n_ok}/{len(per_gene_df)} genes "
+                  f"(trim={args.trim_dir}, baseline={args.pretrim_dir})", flush=True)
+        else:
+            print(f"  WARN: could not read trim_dir ({len(trim_len)} genes) / "
+                  f"pretrim_dir ({len(pre_len)} genes) — trim columns skipped", file=sys.stderr)
     summ        = build_summary(per_gene_df, has_prefilter)
     summary_df  = pd.DataFrame([summ])
 

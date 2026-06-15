@@ -7,7 +7,7 @@
 #   -i/--input        input codon alignment
 #   -o/--output       output deduplicated alignment
 #   -m/--metadata     assemblies_and_species_mammals.tsv  (required)
-#   --gene_counts     TSV from count_assembly_genes.py    (required)
+#   --gene_counts     TSV from count_genes.py    (required)
 #   --dedup_map       species_dedup_map.tsv               (required)
 #   --report          optional report TSV
 

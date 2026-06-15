@@ -208,6 +208,7 @@ process AGGREGATE_FINAL {
 
     input:
     path fubar_tsv
+    path busted_tsv        // busted_results.tsv (or NO_ sentinel if unavailable)
     path meme_json_files   // all MEME JSONs collected
     path map_files         // all *.map.tsv files (may be empty list)
     path gene_var_tsv      // gene_variability.tsv (or NO_ sentinel if unavailable)
@@ -219,6 +220,9 @@ process AGGREGATE_FINAL {
     script:
     def var_arg = (gene_var_tsv && !gene_var_tsv.name.startsWith('NO_'))
                       ? "--variability_tsv '${gene_var_tsv}'"
+                      : ''
+    def busted_arg = (busted_tsv && !busted_tsv.name.startsWith('NO_'))
+                      ? "--busted_tsv '${busted_tsv}'"
                       : ''
     """
     # Arrange MEME JSONs into PSEL/<gene>/ subdirs
@@ -246,6 +250,7 @@ PYEOF
         --fubar_tsv       ${fubar_tsv} \\
         --meme_fdr        ${params.meme_fdr} \\
         \${map_arg} \\
+        ${busted_arg} \\
         ${var_arg}
 
     [[ -f sel_variability.tsv ]] || touch sel_variability.tsv
@@ -368,6 +373,7 @@ workflow HYPHY {
 
     AGGREGATE_FINAL(
         AGGREGATE_FIRST_PASS.out.fubar_tsv,
+        AGGREGATE_FIRST_PASS.out.busted_tsv.ifEmpty(file('NO_BUSTED')),
         all_meme_json,
         all_map_files,
         gene_var_tsv_ch

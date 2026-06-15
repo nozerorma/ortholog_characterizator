@@ -9,7 +9,7 @@ process RENDER_PSEL_REPORT {
     input:
     path fubar_tsv
     path fubar_sites_tsv
-    path fel_tsv
+    path busted_tsv
     path meme_tsv
     path gene_variability_tsv
 
@@ -26,7 +26,7 @@ process RENDER_PSEL_REPORT {
     cp ${projectDir}/subworkflows/positive_selection/local/positive_selection_report.qmd .
     FUBAR_TSV="${fubar_tsv}" \\
     FUBAR_SITES_TSV="${fubar_sites_tsv}" \\
-    FEL_TSV="${fel_tsv}" \\
+    BUSTED_TSV="${busted_tsv}" \\
     MEME_TSV="${meme_tsv}" \\
     GENE_VARIABILITY_TSV="${gene_variability_tsv}" \\
     TAXID_TSV="${taxid}" \\
@@ -34,6 +34,9 @@ process RENDER_PSEL_REPORT {
     SPECIES_TREE="${sp_tree}" \\
     HYPHY_METHODS="${methods}" \\
     FUBAR_THRESHOLD="${threshold}" \\
+    FUBAR_FDR="${params.fubar_fdr}" \\
+    BUSTED_FDR="${params.busted_fdr}" \\
+    MEME_FDR="${params.meme_fdr}" \\
     quarto render positive_selection_report.qmd \\
         --output positive_selection_report.html \\
         --output-dir .
@@ -45,7 +48,7 @@ workflow PSEL_REPORT {
     take:
     fubar_tsv
     fubar_sites_tsv
-    fel_tsv
+    busted_tsv
     meme_tsv
     gene_variability_tsv
 
@@ -54,7 +57,7 @@ workflow PSEL_REPORT {
     RENDER_PSEL_REPORT(
         fubar_tsv,
         fubar_sites_tsv,
-        fel_tsv,
+        busted_tsv,
         meme_tsv,
         gene_variability_tsv
     )

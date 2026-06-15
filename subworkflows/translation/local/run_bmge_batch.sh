@@ -122,16 +122,18 @@ PYEOF
         [[ ! -s "$f" ]] && rm -f "$f"
     done
 
-    # Back-translate protein alignment → correct CDS alignment.
-    # BMGE's -of is broken in CODON mode (truncates to protein length);
-    # we reconstruct the CDS by mapping the protein alignment back to
-    # the original gap-stripped codons.
-    if [[ -s "$prot_out" ]]; then
+    # Reconstruct the trimmed CDS alignment by projecting the original aligned
+    # CDS onto the codon columns BMGE selected (recorded in the TRACK HTML).
+    # BMGE's -of is broken in CODON mode (truncates to protein length), and a
+    # residue-counting back-translation frame-shifts wherever BMGE trims an
+    # informative column — so we slice columns directly from the track instead.
+    if [[ -s "$prot_out" && -s "$track_out" ]]; then
         if ! "$PYTHON" "$BACKTRANSLATE" \
-                --prot "$prot_out" \
-                --cds  "$fasta" \
-                --out  "$trim_out" 2>&1; then
-            echo "[BMGE] WARN: back-translation failed for $gene_id, skipping" >&2
+                --cds   "$fasta" \
+                --track "$track_out" \
+                --out   "$trim_out" \
+                --prot  "$prot_out" 2>&1; then
+            echo "[BMGE] WARN: trim-CDS projection failed for $gene_id, skipping" >&2
             rm -f "$trim_out" "$track_out" "$prot_out"
             return
         fi

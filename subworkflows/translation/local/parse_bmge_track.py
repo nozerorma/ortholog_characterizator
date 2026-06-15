@@ -230,7 +230,17 @@ def main():
                         help='Reference species header pattern (default: Homo_sapiens)')
     args = parser.parse_args()
 
-    gene = os.path.basename(args.out_tsv).replace('.tsv', '')
+    # Derive the bare gene symbol for the gene→protein_id equivalence lookup.
+    # out_tsv is "<GENE>.<RefSpecies>.map.tsv" (e.g. LCORL.Homo_sapiens.map.tsv),
+    # but the equiv table is keyed by bare symbol (LCORL). Strip the .map.tsv
+    # suffixes and the trailing reference-species tag, otherwise every lookup
+    # misses and hg38_nt_coord is always NA.
+    gene = os.path.basename(args.out_tsv)
+    for suffix in ('.tsv', '.map'):
+        if gene.endswith(suffix):
+            gene = gene[:-len(suffix)]
+    if args.ref_species and gene.endswith('.' + args.ref_species):
+        gene = gene[:-len('.' + args.ref_species)]
 
     # 1. Parse TRACK HTML
     selected, removed = parse_track_html(args.track_html)

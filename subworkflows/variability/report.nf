@@ -14,8 +14,10 @@ process RENDER_VARIABILITY_REPORT {
     path prot_files
     path domain_tsv
     path sel_variability_tsv
+    path meme_tsv
     path ucr_windows_tsv
     path ucr_positions_tsv
+    path ucr_clade_variability_tsv
 
     output:
     path "variability_report.html", emit: report_html
@@ -39,8 +41,10 @@ process RENDER_VARIABILITY_REPORT {
     FAMILY_ORDER_TSV="${fam_order}" \\
     SPECIES_TREE="${sp_tree}" \\
     SEL_VARIABILITY_TSV="${sel_variability_tsv}" \\
+    MEME_TSV="${meme_tsv}" \\
     UCR_WINDOWS_TSV="${ucr_windows_tsv}" \\
     UCR_POSITIONS_TSV="${ucr_positions_tsv}" \\
+    UCR_CLADE_VARIABILITY_TSV="${ucr_clade_variability_tsv}" \\
     quarto render variability_report.qmd \\
         --output variability_report.html \\
         --output-dir .
@@ -57,8 +61,10 @@ workflow VARIABILITY_REPORT {
     prot_files_ch
     domain_tsv_ch
     sel_variability_tsv_ch
+    meme_tsv_ch
     ucr_windows_ch
     ucr_positions_ch
+    ucr_clade_variability_ch
 
     main:
 
@@ -70,8 +76,10 @@ workflow VARIABILITY_REPORT {
         prot_files_ch.ifEmpty([]).collect(),
         domain_tsv_ch,
         sel_variability_tsv_ch.ifEmpty(file('NO_SEL_VAR')),
+        meme_tsv_ch.ifEmpty(file('NO_MEME')),
         ucr_windows_ch.ifEmpty(file('NO_UCR_WINDOWS')),
-        ucr_positions_ch.ifEmpty(file('NO_UCR_POSITIONS'))
+        ucr_positions_ch.ifEmpty(file('NO_UCR_POSITIONS')),
+        ucr_clade_variability_ch.ifEmpty(file('NO_UCR_CLADE_VAR'))
     )
 
     emit:

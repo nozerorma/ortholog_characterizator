@@ -11,7 +11,12 @@
 #   --assemblies    PATH   assemblies_and_species.tsv (default: auto-detect)
 #   --pfam_desc     PATH   pfam_descriptions.tsv (default: auto-detect)
 #   --family_order_tsv PATH  family_to_order.tsv (default: auto-detect)
+#   --gene_counts_tsv PATH   gene_counts.tsv (default: auto-detect)
+#   --domain_tsv    PATH   domain_variability.tsv (default: auto-detect)
 #   --sel_var_tsv   PATH   sel_variability.tsv from positive-selection run (optional)
+#   --ucr_windows   PATH   ucr_windows.tsv (default: auto-detect in results_dir/reports/variability/)
+#   --ucr_positions PATH   ucr_positions.tsv (default: auto-detect)
+#   --ucr_clade_var PATH   ucr_clade_variability.tsv (default: auto-detect)
 #   --out_dir       PATH   Where to write the HTML files (default: results_dir/reports)
 
 set -euo pipefail
@@ -21,7 +26,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESULTS_DIR=""
 PSEL_TREE=""
 OUT_REPORT_DIR=""
+GENE_COUNTS_TSV=""
+DOMAIN_TSV=""
 SEL_VAR_TSV=""
+UCR_WINDOWS_TSV=""
+UCR_POSITIONS_TSV=""
+UCR_CLADE_VAR_TSV=""
 
 # Auto-detect species tree
 REPO_ROOT_EARLY="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -54,7 +64,12 @@ while [[ $# -gt 0 ]]; do
         --assemblies)       ASSEMBLIES_TSV="$2";    shift 2 ;;
         --pfam_desc)        PFAM_DESC_TSV="$2";     shift 2 ;;
         --family_order_tsv) FAMILY_ORDER_TSV="$2";  shift 2 ;;
+        --gene_counts_tsv)  GENE_COUNTS_TSV="$2";   shift 2 ;;
+        --domain_tsv)       DOMAIN_TSV="$2";       shift 2 ;;
         --sel_var_tsv)      SEL_VAR_TSV="$2";       shift 2 ;;
+        --ucr_windows)      UCR_WINDOWS_TSV="$2";   shift 2 ;;
+        --ucr_positions)    UCR_POSITIONS_TSV="$2"; shift 2 ;;
+        --ucr_clade_var)    UCR_CLADE_VAR_TSV="$2"; shift 2 ;;
         --out_dir)          OUT_REPORT_DIR="$2";    shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -103,17 +118,51 @@ if [[ -z "$SEL_VAR_TSV" ]]; then
     [[ -f "$_sv_cand" ]] && SEL_VAR_TSV="$_sv_cand"
 fi
 
+if [[ -z "$GENE_COUNTS_TSV" ]]; then
+    for _gcand in \
+        "${RESULTS_DIR}/quality/gene_counts/gene_counts.tsv" \
+        "${RESULTS_DIR}/reports/translation/quality/gene_counts.tsv"; do
+        [[ -f "$_gcand" ]] && { GENE_COUNTS_TSV="$_gcand"; break; }
+    done
+fi
+
+if [[ -z "$DOMAIN_TSV" ]]; then
+    for _dcand in \
+        "${RESULTS_DIR}/reports/variability/domain_variability.tsv" \
+        "${RESULTS_DIR}/reports/variability/domain_variability.domtbl.tsv"; do
+        [[ -f "$_dcand" ]] && { DOMAIN_TSV="$_dcand"; break; }
+    done
+fi
+
+if [[ -z "$UCR_WINDOWS_TSV" ]]; then
+    _uw_cand="${RESULTS_DIR}/reports/variability/ucr_windows.tsv"
+    [[ -f "$_uw_cand" ]] && UCR_WINDOWS_TSV="$_uw_cand"
+fi
+if [[ -z "$UCR_POSITIONS_TSV" ]]; then
+    _up_cand="${RESULTS_DIR}/reports/variability/ucr_positions.tsv"
+    [[ -f "$_up_cand" ]] && UCR_POSITIONS_TSV="$_up_cand"
+fi
+if [[ -z "$UCR_CLADE_VAR_TSV" ]]; then
+    _uc_cand="${RESULTS_DIR}/reports/variability/ucr_clade_variability.tsv"
+    [[ -f "$_uc_cand" ]] && UCR_CLADE_VAR_TSV="$_uc_cand"
+fi
+
 echo "Results dir      : $RESULTS_DIR"
 echo "Output dir       : $OUT_REPORT_DIR"
 echo "Work dir         : $WORK_DIR"
 echo "Assemblies       : ${ASSEMBLIES_TSV:-NOT FOUND (taxonomy/assembly plots will be skipped)}"
 echo "Taxid TSV        : ${TAXID_TSV}"
 echo "Family→Order     : ${FAMILY_ORDER_TSV:-NOT FOUND (order breakdown will be skipped)}"
+echo "Gene counts TSV  : ${GENE_COUNTS_TSV:-NOT FOUND (species-count breakdown will be skipped)}"
+echo "Domain TSV       : ${DOMAIN_TSV:-not found (Pfam domain/clan sections will be skipped)}"
 echo "Species tree     : ${PSEL_TREE:-NOT FOUND (phylogenetic trees will be skipped)}"
 echo "Translation mode : $_TRANSLATION_MODE"
 echo "Filter mode      : $_FILTER_MODE"
 echo "Trim dir         : ${_TRIM_DIR:-not found}"
 echo "Sel-var TSV      : ${SEL_VAR_TSV:-not found (psel section in variability report will be skipped)}"
+echo "UCR windows TSV  : ${UCR_WINDOWS_TSV:-not found}"
+echo "UCR positions TSV: ${UCR_POSITIONS_TSV:-not found}"
+echo "UCR clade TSV    : ${UCR_CLADE_VAR_TSV:-not found}"
 echo ""
 
 # ── 1. Post-translation report ─────────────────────────────────────────────────
@@ -135,6 +184,8 @@ METADATA_TSV="${RESULTS_DIR}/reports/translation/metadata/metadata.combined_summ
     ASSEMBLIES_TSV="$ASSEMBLIES_TSV" \
     TAXID_TSV="$TAXID_TSV" \
     FAMILY_ORDER_TSV="$FAMILY_ORDER_TSV" \
+    GENE_COUNTS_TSV="$GENE_COUNTS_TSV" \
+    DOMAIN_TSV="$DOMAIN_TSV" \
     DEDUP_DIR="${RESULTS_DIR}/DEDUP" \
     PREFILTER_DIR="$_PREFILTER_DIR" \
     FILTER_MODE="$_FILTER_MODE" \
@@ -174,6 +225,9 @@ PROT_VAR_RAW="${RESULTS_DIR}/PROT_VAR_RAW"
     FAMILY_ORDER_TSV="$FAMILY_ORDER_TSV" \
     SPECIES_TREE="${PSEL_TREE}" \
     SEL_VARIABILITY_TSV="${SEL_VAR_TSV}" \
+    UCR_WINDOWS_TSV="$UCR_WINDOWS_TSV" \
+    UCR_POSITIONS_TSV="$UCR_POSITIONS_TSV" \
+    UCR_CLADE_VARIABILITY_TSV="$UCR_CLADE_VAR_TSV" \
     quarto render variability_report.qmd \
         --output variability_report.html \
         --output-dir .
@@ -203,7 +257,7 @@ MEME_TSV="${PSEL_DIR}/meme_results.tsv"
     TAXID_TSV="$TAXID_TSV" \
     FAMILY_ORDER_TSV="$FAMILY_ORDER_TSV" \
     SPECIES_TREE="${PSEL_TREE}" \
-    HYPHY_METHODS="FUBAR" \
+    HYPHY_METHODS="FUBAR,FEL" \
     FUBAR_THRESHOLD="0.9" \
     quarto render positive_selection_report.qmd \
         --output positive_selection_report.html \

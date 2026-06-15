@@ -60,12 +60,13 @@ def parse_domtblout(domtblout_path, evalue_threshold=0.01):
     """
     Parse hmmscan --domtblout output.
     Relevant columns (0-indexed, space-separated):
-      0:  target_name  (HMM NAME field, e.g. 'Ig_2' — human-readable but not stable)
+      0:  target_name  (HMM NAME field, e.g. 'Ig_2')
       1:  accession    (HMM ACC field, e.g. 'PF13895.13' → strip to 'PF13895')
       3:  query_name   (gene name)
       17: ali_from     (1-based start in query sequence)
       18: ali_to       (1-based end in query sequence)
       11: i-evalue
+      22+: description of target (joined remainder after fixed fields)
     Returns list of dicts; domain_instance is per-(gene, pfam_id) counter.
     """
     hits = []
@@ -76,7 +77,7 @@ def parse_domtblout(domtblout_path, evalue_threshold=0.01):
             if line.startswith('#') or not line.strip():
                 continue
             fields = line.split()
-            if len(fields) < 19:
+            if len(fields) < 23:
                 continue
             try:
                 i_evalue = float(fields[11])
@@ -85,27 +86,48 @@ def parse_domtblout(domtblout_path, evalue_threshold=0.01):
             if i_evalue > evalue_threshold:
                 continue
 
-            acc_raw = fields[1]
-            pfam_id = acc_raw.split('.')[0]  # strip version: PF13895.13 → PF13895
-            gene = fields[3]
+            target_name = fields[0]
+            acc_raw     = fields[1]
+            pfam_id     = acc_raw.split('.')[0]  # strip version: PF13895.13 → PF13895
+            gene        = fields[3]
+            description = ' '.join(fields[22:])
             try:
                 ali_start = int(fields[17])
-                ali_end = int(fields[18])
+                ali_end   = int(fields[18])
             except ValueError:
                 continue
 
             key = (gene, pfam_id)
             domain_counter[key] += 1
             hits.append({
-                'pfam_id': pfam_id,
-                'gene': gene,
-                'ali_start': ali_start,
-                'ali_end': ali_end,
-                'i_evalue': i_evalue,
+                'pfam_id':         pfam_id,
+                'target_name':     target_name,
+                'description':     description,
+                'gene':            gene,
+                'ali_start':       ali_start,
+                'ali_end':         ali_end,
+                'i_evalue':        i_evalue,
                 'domain_instance': domain_counter[key],
             })
 
     return hits
+
+
+def load_clans(clans_tsv_path):
+    """
+    Load Pfam-A.clans.tsv → dict: pfam_acc → (clan_acc, clan_name).
+    File columns: pfam_acc, clan_acc, clan_name, pfam_name, pfam_description
+    Domains not in any clan (orphans) will be absent from the dict.
+    """
+    mapping = {}
+    with open(clans_tsv_path) as fh:
+        for line in fh:
+            parts = line.rstrip('\n').split('\t')
+            if len(parts) < 3:
+                continue
+            pfam_acc, clan_acc, clan_name = parts[0], parts[1], parts[2]
+            mapping[pfam_acc] = (clan_acc, clan_name)
+    return mapping
 
 
 # ---------------------------------------------------------------------------
@@ -228,9 +250,16 @@ def main():
                         help='Reference species name for coordinate mapping (default: Homo_sapiens)')
     parser.add_argument('--evalue_threshold', type=float, default=0.01,
                         help='i-evalue cutoff for domain hits (default 0.01)')
+    parser.add_argument('--pfam_clans_tsv', default=None,
+                        help='Pfam-A.clans.tsv: maps pfam_acc → clan_acc, clan_name')
     args = parser.parse_args()
 
     os.makedirs(os.path.dirname(args.out_tsv) or '.', exist_ok=True)
+
+    clan_map = {}
+    if args.pfam_clans_tsv and os.path.isfile(args.pfam_clans_tsv):
+        clan_map = load_clans(args.pfam_clans_tsv)
+        print(f'Loaded {len(clan_map)} clan mappings from {args.pfam_clans_tsv}', flush=True)
 
     hits = parse_domtblout(args.hmmscan_domtblout, args.evalue_threshold)
     if not hits:
@@ -278,9 +307,15 @@ def main():
             max_v  = stats['max_variability']
             mean_g = stats['mean_gap_fraction']
 
+            clan_acc, clan_name = clan_map.get(hit['pfam_id'], ('', ''))
+
             rows.append((
                 gene,
                 hit['pfam_id'],
+                hit['target_name'],
+                hit['description'],
+                clan_acc,
+                clan_name,
                 hit['domain_instance'],
                 ali_start, ali_end,
                 stats['n_positions'],
@@ -291,7 +326,8 @@ def main():
             ))
 
     with open(args.out_tsv, 'w') as fh:
-        fh.write('gene\tpfam_id\tdomain_instance\tali_start\tali_end\t'
+        fh.write('gene\tpfam_id\ttarget_name\tdescription\tclan_acc\tclan_name\t'
+                 'domain_instance\tali_start\tali_end\t'
                  'n_positions\tn_analyzed\tmean_variability\tmax_variability\t'
                  'mean_gap_fraction\n')
         for row in rows:

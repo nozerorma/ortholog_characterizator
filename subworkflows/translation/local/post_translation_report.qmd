@@ -53,6 +53,7 @@ FILTER_MODE      = os.environ.get("FILTER_MODE",      "chi2")
 TRIM_DIR         = os.environ.get("TRIM_DIR",         "")
 TRANSLATION_MODE = os.environ.get("TRANSLATION_MODE", "bmge")
 SPECIES_TREE     = os.environ.get("SPECIES_TREE",     "")
+GENE_COUNTS_TSV  = os.environ.get("GENE_COUNTS_TSV",  "")
 
 T10 = px.colors.qualitative.T10
 TPL = "plotly_white"
@@ -114,6 +115,11 @@ if _safe(TAXID_TSV):
 fam_order_df = pd.DataFrame()
 if _safe(FAMILY_ORDER_TSV):
     fam_order_df = pd.read_csv(FAMILY_ORDER_TSV, sep='\t')
+
+# ── Gene counts (species → n_genes, from pipeline quality step) ───────────────
+gene_counts = pd.DataFrame()
+if _safe(GENE_COUNTS_TSV):
+    gene_counts = pd.read_csv(GENE_COUNTS_TSV, sep='\t')
 
 # ── PROT FASTA inventory ───────────────────────────────────────────────────────
 prot_files = sorted(Path(PROT_DIR).glob("*.prot.fa")) or sorted(Path(PROT_DIR).glob("*.fa"))
@@ -233,21 +239,64 @@ if 'completeness_pct' in qual.columns:
 #| label: bmge-trim
 #| echo: false
 
-if TRANSLATION_MODE == 'bmge' and 'trim_len' in qual.columns and 'aln_len' in qual.columns:
-    qual['frac_trimmed'] = 1 - qual['trim_len'] / qual['aln_len'].replace(0, np.nan)
-    fig = px.histogram(qual, x='frac_trimmed', nbins=50,
+def _aln_len_by_gene(dirpath):
+    """Per-gene aligned column count (codons) — read only the first record of
+    each FASTA, since aligned sequences are all the same length."""
+    p = Path(dirpath) if dirpath else None
+    if not p or not p.is_dir():
+        return {}
+    out = {}
+    for fa in sorted(p.glob('*.fa')):
+        rec = next(SeqIO.parse(fa, 'fasta'), None)
+        if rec is not None:
+            out[_fa_gene_id(fa)] = len(rec.seq) // 3   # nt → codon columns
+    return out
+
+# Preferred path: a properly-staged quality CSV that already carries trim columns.
+_raw_len = next((c for c in ('aln_len', 'raw_aln_len') if c in qual.columns), None)
+frac_df  = None
+if TRANSLATION_MODE != 'bmge':
+    pass
+elif 'trim_pct_cols_kept' in qual.columns:
+    frac_df = (1 - qual['trim_pct_cols_kept'] / 100.0).clip(lower=0)
+elif 'trim_cols_removed' in qual.columns and _raw_len:
+    frac_df = (qual['trim_cols_removed'] / qual[_raw_len].replace(0, np.nan)).clip(lower=0)
+elif 'trim_aln_len' in qual.columns and _raw_len:
+    frac_df = (1 - qual['trim_aln_len'] / qual[_raw_len].replace(0, np.nan)).clip(lower=0)
+
+# Fallback (the usual path here): the per-gene quality CSV is built without the
+# TRIM/ stage staged, so it lacks trim_* columns. Compute the trimmed fraction
+# directly from the BMGE input (PREFILTER, else DEDUP) vs the TRIM output.
+if frac_df is None and TRANSLATION_MODE == 'bmge' and _safe(TRIM_DIR):
+    pre_dir = PREFILTER_DIR if _safe(PREFILTER_DIR) else DEDUP_DIR
+    pre_len  = _aln_len_by_gene(pre_dir)
+    trim_len = _aln_len_by_gene(TRIM_DIR)
+    rows = [{'gene': g, 'pre_cols': pre_len[g], 'trim_cols': tl,
+             'frac_trimmed': max(0.0, 1 - tl / pre_len[g])}
+            for g, tl in trim_len.items() if pre_len.get(g)]
+    if rows:
+        bmge_df = pd.DataFrame(rows)
+        frac_df = bmge_df['frac_trimmed']
+
+if frac_df is not None and not frac_df.dropna().empty:
+    _src = pd.DataFrame({'frac_trimmed': frac_df})
+    _ft = _src['frac_trimmed'].dropna()
+    fig = px.histogram(_src, x='frac_trimmed', nbins=50,
                        labels={'frac_trimmed': 'Fraction trimmed by BMGE'},
                        title='BMGE: fraction of alignment columns trimmed per gene',
                        color_discrete_sequence=[T10[1]])
     fig.update_layout(bargap=0.05)
     show_fig(fig)
 
-    q25, med, q75 = qual['frac_trimmed'].quantile([0.25, 0.5, 0.75])
-    display(Markdown(f"**Median fraction trimmed:** {med:.2%} (IQR {q25:.2%}–{q75:.2%})"))
+    q25, med, q75 = _ft.quantile([0.25, 0.5, 0.75])
+    display(Markdown(f"**Median fraction trimmed:** {med:.2%} (IQR {q25:.2%}–{q75:.2%}) "
+                     f"across {len(_ft)} genes"))
 elif TRANSLATION_MODE != 'bmge':
     display(Markdown("*Manual translation mode — no BMGE trim stats.*"))
 else:
-    display(Markdown("*BMGE trim_len column not found in quality data.*"))
+    display(Markdown("*BMGE trim statistics unavailable — need either trim columns in "
+                     "the quality CSV or both the BMGE input (PREFILTER/DEDUP) and TRIM "
+                     "alignment directories.*"))
 ```
 
 ## Taxonomy breakdown
@@ -256,100 +305,69 @@ else:
 #| label: taxonomy
 #| echo: false
 
-if not taxid.empty and not asm.empty:
+if not gene_counts.empty and not taxid.empty:
+    sp_col  = next((c for c in taxid.columns if c.lower() == 'species'), None)
     fam_col = next((c for c in taxid.columns if 'family' in c.lower()), None)
 
-    # Join assemblies ↔ taxid on numeric taxid ID (most reliable)
-    asm_taxid_col = next((c for c in asm.columns
-                          if 'taxonomy id' in c.lower() or c.lower() in ('taxid', 'tax_id')), None)
-    tax_id_col    = next((c for c in taxid.columns if c.lower() in ('tax_id', 'taxid')), None)
-
-    if asm_taxid_col and tax_id_col:
-        keep_tax = [tax_id_col] + ([fam_col] if fam_col else [])
-        asm_taxid = asm.merge(
-            taxid[keep_tax].drop_duplicates(subset=[tax_id_col]),
-            left_on=asm_taxid_col, right_on=tax_id_col, how='left'
-        )
-    else:
-        # Fallback: normalize species names (spaces ↔ underscores) and join
-        sp_col_asm = next((c for c in asm.columns if c.lower() == 'species'), None)
-        sp_col_tax = next((c for c in taxid.columns if c.lower() == 'species'), None)
-        if sp_col_asm and sp_col_tax:
-            asm2 = asm.copy()
-            asm2['_sp_key'] = asm2[sp_col_asm].str.replace(' ', '_', regex=False)
-            tax2 = taxid.copy()
-            tax2['_sp_key'] = tax2[sp_col_tax].str.replace(' ', '_', regex=False)
-            keep_tax = ['_sp_key'] + ([fam_col] if fam_col else [])
-            asm_taxid = asm2.merge(tax2[keep_tax].drop_duplicates('_sp_key'),
-                                   on='_sp_key', how='left').drop(columns='_sp_key')
+    if sp_col and fam_col:
+        # Filter to scientific name entries only, one row per species
+        name_col = 'name_class' if 'name_class' in taxid.columns else None
+        if name_col:
+            tax_sp = taxid[taxid[name_col] == 'scientific name'][[sp_col, fam_col]].drop_duplicates(sp_col)
         else:
-            display(Markdown("*Could not join assemblies with taxid — no usable key column found.*"))
-            asm_taxid = pd.DataFrame()
+            tax_sp = taxid[[sp_col, fam_col]].drop_duplicates(sp_col)
+        tax_sp = tax_sp.copy()
+        tax_sp['_sp'] = tax_sp[sp_col].str.replace(' ', '_', regex=False)
 
-    # Resolve order: taxid file may lack an 'order' column; use family_to_order if available
-    order_col_name = next((c for c in (asm_taxid.columns if not asm_taxid.empty else [])
-                           if 'order' in c.lower()), None)
-    if order_col_name is None and fam_col and not fam_order_df.empty and not asm_taxid.empty:
-        fo_fam = next((c for c in fam_order_df.columns if 'family' in c.lower()), None)
-        fo_ord = next((c for c in fam_order_df.columns if 'order'  in c.lower()), None)
-        if fo_fam and fo_ord:
-            asm_taxid = asm_taxid.merge(
-                fam_order_df[[fo_fam, fo_ord]].rename(columns={fo_fam: fam_col, fo_ord: '_order'}),
-                on=fam_col, how='left'
-            )
-            order_col_name = '_order'
+        # gene_counts first column is species name (with underscores)
+        sp_name_col = gene_counts.columns[0]
+        gc = gene_counts[[sp_name_col]].copy()
+        gc['_sp'] = gc[sp_name_col]
 
-    if not asm_taxid.empty and order_col_name:
-        order_counts = asm_taxid[order_col_name].value_counts().reset_index()
-        order_counts.columns = ['Order', 'n_assemblies']
-        order_counts = order_counts.sort_values('n_assemblies', ascending=True)
+        gc_tax = gc.merge(tax_sp[['_sp', fam_col]], on='_sp', how='left')
 
-        fig = px.bar(order_counts, x='n_assemblies', y='Order', orientation='h',
-                     title='Assemblies per mammalian order',
-                     color_discrete_sequence=[T10[2]])
-        fig.update_layout(height=max(400, len(order_counts) * 22))
-        show_fig(fig)
+        # Resolve order from family_order_df if available
+        order_col = None
+        if not fam_order_df.empty:
+            fo_fam = next((c for c in fam_order_df.columns if 'family' in c.lower()), None)
+            fo_ord = next((c for c in fam_order_df.columns if 'order'  in c.lower()), None)
+            if fo_fam and fo_ord:
+                gc_tax = gc_tax.merge(
+                    fam_order_df[[fo_fam, fo_ord]].rename(columns={fo_fam: fam_col, fo_ord: '_order'}),
+                    on=fam_col, how='left'
+                )
+                order_col = '_order'
 
-        if fam_col and fam_col in asm_taxid.columns:
-            fam_counts = asm_taxid[fam_col].value_counts().reset_index()
-            fam_counts.columns = ['Family', 'n_assemblies']
-            fam_counts = fam_counts.sort_values('n_assemblies', ascending=True).tail(40)
-            fig2 = px.bar(fam_counts, x='n_assemblies', y='Family', orientation='h',
-                          title='Top 40 families by assembly count',
+        if order_col and order_col in gc_tax.columns:
+            order_counts = (gc_tax.groupby(order_col)[sp_name_col]
+                            .count().reset_index()
+                            .rename(columns={sp_name_col: 'n_species', order_col: 'Order'})
+                            .sort_values('n_species', ascending=True))
+            fig = px.bar(order_counts, x='n_species', y='Order', orientation='h',
+                         title='Species per mammalian order',
+                         color_discrete_sequence=[T10[2]])
+            fig.update_layout(height=max(400, len(order_counts) * 22))
+            show_fig(fig)
+        else:
+            display(Markdown("*Order column not resolved — pass `FAMILY_ORDER_TSV` to map families to orders.*"))
+
+        if fam_col in gc_tax.columns:
+            fam_counts = (gc_tax.groupby(fam_col)[sp_name_col]
+                          .count().reset_index()
+                          .rename(columns={sp_name_col: 'n_species', fam_col: 'Family'})
+                          .sort_values('n_species', ascending=True).tail(40))
+            fig2 = px.bar(fam_counts, x='n_species', y='Family', orientation='h',
+                          title='Top 40 families by species count',
                           color_discrete_sequence=[T10[4]])
             fig2.update_layout(height=max(400, len(fam_counts) * 22))
             show_fig(fig2)
-    elif not asm_taxid.empty:
-        display(Markdown("*Joined assemblies with taxid but no order column found. "
-                         "Pass `FAMILY_ORDER_TSV` to resolve orders from families.*"))
+    else:
+        display(Markdown("*Could not find species/family columns in taxid file.*"))
 else:
     missing = []
-    if taxid.empty:  missing.append("taxid_tsv")
-    if asm.empty:    missing.append("assemblies_tsv")
+    if gene_counts.empty: missing.append("gene_counts_tsv")
+    if taxid.empty:       missing.append("taxid_tsv")
     display(Markdown(f"*Taxonomy breakdown requires: {', '.join(missing)}.*"))
-```
-
-## Assembly quality
-
-```{python}
-#| label: assembly-quality
-#| echo: false
-
-status_col = next((c for c in asm.columns if 'status' in c.lower() or 'level' in c.lower()), None)
-
-if not asm.empty and status_col:
-    status_order = ["Chromosome", "Complete Genome", "Scaffold", "Contig", "Zoonomia"]
-    counts = asm[status_col].value_counts().reindex(status_order).dropna().reset_index()
-    counts.columns = ['Assembly level', 'Count']
-
-    fig = px.bar(counts, x='Assembly level', y='Count',
-                 color='Assembly level',
-                 color_discrete_sequence=T10,
-                 title='Assemblies by quality level')
-    fig.update_layout(showlegend=False)
-    show_fig(fig)
-else:
-    display(Markdown("*Assembly quality breakdown requires assemblies_tsv with a status/level column.*"))
 ```
 
 ## Clade-level quality
@@ -392,6 +410,7 @@ def _read_fa_dir(dirpath, ambig_fn) -> pd.DataFrame:
         gid = _fa_gene_id(fa)
         for rec in SeqIO.parse(fa, 'fasta'):
             rows.append({'species': rec.id, 'gene': gid,
+                         'aln_len': len(rec.seq),
                          'ambig_pct': ambig_fn(str(rec.seq))})
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
@@ -557,6 +576,7 @@ else:
                               title=f'{_cl}: {lbl_a} → {lbl_b} (points below diagonal = improved)',
                               labels={lbl_a: f'Mean ambiguity {lbl_a} (%)',
                                       lbl_b: f'Mean ambiguity {lbl_b} (%)'})
+            fig.update_traces(marker=dict(line=dict(width=1.2, color='rgba(30,30,30,0.5)')))
             fig.add_shape(type='line', x0=0, y0=0, x1=_lim, y1=_lim,
                           line=dict(dash='dash', color='grey', width=1))
             show_fig(fig, height=500)
@@ -621,6 +641,7 @@ else:
                          title=f'{_cl} quality ({_prot_lbl}): gene coverage vs residue ambiguity',
                          labels={'mean_genes': 'Mean genes per species',
                                  'mean_ambig': 'Mean ambiguity (%)'})
+        fig.update_traces(marker=dict(line=dict(width=1.2, color='rgba(30,30,30,0.5)')))
         show_fig(fig, height=500)
 
         # ── Bar: gene coverage coloured by ambiguity ─────────────────────────
@@ -704,6 +725,7 @@ else:
             sp_to_order = tax.set_index('_tip')[ord_col].to_dict()
 
             tip_orders = [sp_to_order.get(t, 'Unknown') for t in tip_names]
+            tip_orders = [o if isinstance(o, str) and o == o else 'Unknown' for o in tip_orders]
 
             # ── Assign a colour to each order ────────────────────────────────
             import matplotlib.colors as _mc
@@ -738,20 +760,39 @@ else:
                 node_labels = [''] * n_nodes  # fallback: no labels
 
             n_nodes  = tree.nnodes
-            node_col = tip_colors + ['rgba(0,0,0,0)'] * (n_nodes - len(tip_names))
-            node_sz  = [6] * len(tip_names) + [0] * (n_nodes - len(tip_names))
+            # No tip markers/dots — order is conveyed by branch colour + MRCA labels.
+            node_col = ['rgba(0,0,0,0)'] * n_nodes
+            node_sz  = [0] * n_nodes
+
+            # ── Colour branches by order ─────────────────────────────────────
+            # Colour each edge by dominant descendant order for a cleaner long
+            # dendrogram view.
+            from collections import Counter
+            name_to_order = dict(zip(tip_names, tip_orders))
+            edge_colors = ['#999999'] * n_nodes
+            for node in tree.traverse():
+                ords = [name_to_order.get(l, 'Unknown') for l in node.get_leaf_names()]
+                ords = [o for o in ords if o != 'Unknown']
+                if ords:
+                    dominant = Counter(ords).most_common(1)[0][0]
+                    edge_colors[node.idx] = order_color[dominant]
 
             canvas, *_ = tree.draw(
-                layout='c',
-                edge_type='c',
+                layout='r',
+                edge_type='p',
                 tip_labels=False,
                 tip_labels_align=False,
                 node_colors=node_col,
                 node_sizes=node_sz,
                 node_labels=node_labels,
                 node_labels_style={"font-size": "8px", "fill": "#333333"},
-                width=750,
-                height=750,
+                edge_colors=edge_colors,
+                use_edge_lengths=True,
+                padding=10,
+                edge_style={"stroke-width": 2.0},
+                scale_bar=True,
+                width=1300,
+                height=920,
             )
             toyplot.html.render(canvas, "phylo_species_coverage.html")
             from IPython.display import HTML

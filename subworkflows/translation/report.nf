@@ -36,11 +36,21 @@ process QUALITY_REPORT_DATA {
 
     script:
     // quality_report.py: --align_dir, --out_dir, --output, [--gene_list]
+    // The TRIM and BMGE-input (PREFILTER, else DEDUP) codon dirs live in the
+    // published results tree, not in this process's work dir, so pass them
+    // explicitly to derive the codon-level BMGE trim columns.
+    def filter_mode = params.filter_mode ?: 'chi2'
+    def trim_dir    = "${params.out_dir}/TRIM/bmge"
+    def pretrim_dir = (filter_mode != 'none')
+                      ? "${params.out_dir}/PREFILTER/${filter_mode}"
+                      : "${params.out_dir}/DEDUP"
     """
     python3 ${projectDir}/subworkflows/translation/local/quality_report.py \\
-        --align_dir . \\
-        --out_dir   . \\
-        --output    quality_data
+        --align_dir   . \\
+        --out_dir     . \\
+        --output      quality_data \\
+        --trim_dir    "${trim_dir}" \\
+        --pretrim_dir "${pretrim_dir}"
     """
 }
 
@@ -69,6 +79,7 @@ process RENDER_TRANSLATION_REPORT {
                         ? "${params.out_dir}/PREFILTER/${filter_mode}"
                         : ''
     def trim_dir      = "${params.out_dir}/TRIM/bmge"
+    def gene_counts   = "${params.out_dir}/quality/gene_counts/gene_counts.tsv"
     // Locate the metadata TSV (generate_metadata.py writes metadata.<something>.tsv)
     """
     cp ${projectDir}/subworkflows/translation/local/post_translation_report.qmd .
@@ -79,6 +90,7 @@ process RENDER_TRANSLATION_REPORT {
     ASSEMBLIES_TSV="${assemblies}" \\
     TAXID_TSV="${taxid}" \\
     FAMILY_ORDER_TSV="${fam_order}" \\
+    GENE_COUNTS_TSV="${gene_counts}" \\
     SPECIES_TREE="${sp_tree}" \\
     TRANSLATION_MODE="bmge" \\
     DEDUP_DIR="${dedup_dir}" \\

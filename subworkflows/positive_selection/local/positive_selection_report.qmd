@@ -42,14 +42,17 @@ warnings.filterwarnings("ignore")
 
 FUBAR_TSV            = os.environ.get("FUBAR_TSV",            "fubar_results.tsv")
 FUBAR_SITES_TSV      = os.environ.get("FUBAR_SITES_TSV",      "")
-FEL_TSV              = os.environ.get("FEL_TSV",              "fel_results.tsv")
+BUSTED_TSV           = os.environ.get("BUSTED_TSV",           "")
 MEME_TSV             = os.environ.get("MEME_TSV",             "")
 GENE_VARIABILITY_TSV = os.environ.get("GENE_VARIABILITY_TSV", "")
 TAXID_TSV            = os.environ.get("TAXID_TSV",            "")
 FAMILY_ORDER_TSV     = os.environ.get("FAMILY_ORDER_TSV",     "")
 SPECIES_TREE         = os.environ.get("SPECIES_TREE",         "")
-HYPHY_METHODS        = os.environ.get("HYPHY_METHODS",        "FUBAR,FEL")
+HYPHY_METHODS        = os.environ.get("HYPHY_METHODS",        "FUBAR,BUSTED")
 FUBAR_THRESHOLD      = float(os.environ.get("FUBAR_THRESHOLD", "0.9"))
+FUBAR_FDR            = float(os.environ.get("FUBAR_FDR",  "0.05"))
+BUSTED_FDR           = float(os.environ.get("BUSTED_FDR", "0.05"))
+MEME_FDR             = float(os.environ.get("MEME_FDR",   "0.05"))
 
 T10 = px.colors.qualitative.T10
 TPL = "plotly_white"
@@ -78,22 +81,28 @@ def safe_read(path, **kwargs):
 
 fubar_df    = safe_read(FUBAR_TSV)
 fubar_sites = safe_read(FUBAR_SITES_TSV)
-fel_df      = safe_read(FEL_TSV)
+busted_df   = safe_read(BUSTED_TSV)
 meme_df     = safe_read(MEME_TSV)
 var_df      = safe_read(GENE_VARIABILITY_TSV)
 
 has_meme     = not meme_df.empty
+has_busted   = not busted_df.empty
 has_var      = not var_df.empty
 has_fubar_sites = not fubar_sites.empty
 
-# Build variability × selection join
+# Build variability × selection join.
+# Variability gene IDs carry a trailing ".prot" (protein-mode outputs), e.g.
+# "LCORL.Homo_sapiens.prot"; FUBAR uses "LCORL.Homo_sapiens". Strip ".prot" so
+# the inner merge actually matches instead of returning zero rows.
 sel_var_df = pd.DataFrame()
 if has_var and not fubar_df.empty:
     gene_col_fubar = next((c for c in fubar_df.columns if 'gene' in c.lower()), fubar_df.columns[0])
     gene_col_var   = next((c for c in var_df.columns   if 'gene' in c.lower()), var_df.columns[0])
+    var_df = var_df.copy()
+    var_df[gene_col_var] = var_df[gene_col_var].astype(str).str.replace(r'\.prot$', '', regex=True)
     sel_var_df = fubar_df.merge(var_df, left_on=gene_col_fubar, right_on=gene_col_var, how='inner')
 
-print(f"FUBAR: {len(fubar_df)} genes | FEL: {len(fel_df)} sites | "
+print(f"FUBAR: {len(fubar_df)} genes | BUSTED: {len(busted_df)} genes | "
       f"MEME: {len(meme_df)} genes | variability join: {len(sel_var_df)} genes | methods: {HYPHY_METHODS}")
 ```
 
@@ -107,28 +116,43 @@ from IPython.display import Markdown, display
 
 n_genes_fubar   = len(fubar_df)
 pos_col_fubar   = next((c for c in fubar_df.columns
-                        if 'n_pos' in c.lower()
-                        or 'pos_sites' in c.lower()), None)
+                        if c.lower() == 'n_pos_sites'), None) \
+                  or next((c for c in fubar_df.columns
+                           if 'n_pos' in c.lower() and 'fdr' not in c.lower()), None)
+pos_fdr_col     = next((c for c in fubar_df.columns if 'n_pos' in c.lower() and 'fdr' in c.lower()), None)
 neg_col_fubar   = next((c for c in fubar_df.columns
                         if 'n_neg' in c.lower()
                         or 'neg_sites' in c.lower()), None)
 n_pos_genes     = int((fubar_df[pos_col_fubar] > 0).sum()) if pos_col_fubar else "N/A"
+n_pos_fdr_genes = int((fubar_df[pos_fdr_col] > 0).sum()) if pos_fdr_col else None
 n_neg_genes     = int((fubar_df[neg_col_fubar] > 0).sum()) if neg_col_fubar else "N/A"
 pct_pos         = f"{100 * n_pos_genes / max(n_genes_fubar, 1):.1f}%" if isinstance(n_pos_genes, int) else "N/A"
 pct_neg         = f"{100 * n_neg_genes / max(n_genes_fubar, 1):.1f}%" if isinstance(n_neg_genes, int) else "N/A"
+
+# BUSTED gate (gene-level episodic selection)
+busted_gene_col = next((c for c in busted_df.columns if 'gene' in c.lower()), None) if has_busted else None
+busted_sig_col  = next((c for c in busted_df.columns if 'is_busted_sig' in c.lower()), None) if has_busted else None
+busted_sig_genes = set(busted_df.loc[busted_df[busted_sig_col] == 1, busted_gene_col]) \
+                   if (has_busted and busted_sig_col and busted_gene_col) else set()
+
+fubar_fdr_row = (f"| Genes with **positive** FUBAR sites at empirical Bayesian FDR ≤ {FUBAR_FDR} "
+                 f"| **{n_pos_fdr_genes}** |\n") if n_pos_fdr_genes is not None else ""
+busted_row = (f"| Genes significant by **BUSTED** (gene-level, BH-FDR ≤ {BUSTED_FDR}) "
+              f"| **{len(busted_sig_genes)}** |\n") if has_busted else ""
 
 display(Markdown(f"""
 | Metric | Value |
 |--------|-------|
 | Genes tested | **{n_genes_fubar}** |
 | Methods | **{HYPHY_METHODS}** |
-| FUBAR threshold (PP) | **{FUBAR_THRESHOLD}** |
-| Genes with **positive** selection sites (FUBAR) | **{n_pos_genes}** ({pct_pos}) |
-| Genes with **purifying** selection sites (FUBAR) | **{n_neg_genes}** ({pct_neg}) |
-| MEME run (episodic positive selection) | **{'yes' if has_meme else 'no'}** |
+| Genes with **positive** FUBAR sites (PP ≥ {FUBAR_THRESHOLD}, uncorrected) | **{n_pos_genes}** ({pct_pos}) |
+{fubar_fdr_row}| Genes with **purifying** FUBAR sites (PP ≥ {FUBAR_THRESHOLD}) | **{n_neg_genes}** ({pct_neg}) |
+{busted_row}| MEME run (episodic, site-level) | **{'yes' if has_meme else 'no'}** |
 
-> **FUBAR** tests each site for *pervasive* selection across all branches: PP(α<β) ≥ {FUBAR_THRESHOLD} → positive; PP(α>β) ≥ {FUBAR_THRESHOLD} → purifying.
-> **MEME** tests each site for *episodic* positive selection on a subset of branches (LRT p ≤ 0.05), run only on genes with ≥1 FUBAR-positive site.
+> **FUBAR** — *pervasive* selection per site (Bayesian): PP(α<β) ≥ {FUBAR_THRESHOLD} → positive. Genome-wide calls are
+>   controlled with an empirical Bayesian FDR (expected FDR = mean(1−PP) over called sites), not BH.
+> **BUSTED** — *episodic* selection at the **gene** level; this is the gate that decides which genes go to MEME (BH-FDR ≤ {BUSTED_FDR}).
+> **MEME** — *episodic* selection per **site** within gated genes, BH-FDR ≤ {MEME_FDR} after dropping degenerate sites (dS = 0 or β⁺ at the optimiser boundary).
 """))
 ```
 
@@ -212,7 +236,8 @@ if not fubar_df.empty:
 #| echo: false
 
 if has_fubar_sites:
-    pos_site_col = next((c for c in fubar_sites.columns if 'is_pos' in c.lower() or 'hit' in c.lower()), None)
+    pos_site_col = next((c for c in fubar_sites.columns if 'is_pos_hit_fdr' in c.lower()), None) \
+                   or next((c for c in fubar_sites.columns if 'is_pos' in c.lower()), None)
     prob_col     = next((c for c in fubar_sites.columns if 'prob' in c.lower()), None)
     g_col        = next((c for c in fubar_sites.columns if 'gene' in c.lower()), fubar_sites.columns[0])
 
@@ -235,34 +260,45 @@ else:
     display(Markdown("*FUBAR site-level data (fubar_sites.tsv) not available.*"))
 ```
 
-## FEL results
+## BUSTED gene-level gate
 
 ```{python}
-#| label: fel-volcano
+#| label: busted
 #| echo: false
 
-if not fel_df.empty:
-    pval_col = next((c for c in fel_df.columns if 'p_val' in c.lower() or 'pvalue' in c.lower()), None)
-    dn_col   = next((c for c in fel_df.columns if 'dn' in c.lower() or 'dN' in c), None)
-    ds_col   = next((c for c in fel_df.columns if 'ds' in c.lower() or 'dS' in c), None)
+if has_busted:
+    bg_col = next((c for c in busted_df.columns if 'gene' in c.lower()), busted_df.columns[0])
+    bp_col = next((c for c in busted_df.columns if c.lower() == 'busted_pval'), None)
+    bq_col = next((c for c in busted_df.columns if c.lower() == 'busted_qval'), None)
+    bs_col = next((c for c in busted_df.columns if 'is_busted_sig' in c.lower()), None)
 
-    if pval_col and dn_col and ds_col:
-        fel_df['log10p']   = -np.log10(fel_df[pval_col].replace(0, 1e-300))
-        fel_df['dnds']     = fel_df[dn_col] / fel_df[ds_col].replace(0, np.nan)
-        fel_df['selected'] = (fel_df[pval_col] < 0.05) & (fel_df['dnds'] > 1)
+    n_sig = int(busted_df[bs_col].sum()) if bs_col else 0
+    display(Markdown(f"""
+| Metric | Value |
+|--------|-------|
+| Genes tested by BUSTED | **{len(busted_df):,}** |
+| Genes significant (BH-FDR ≤ {BUSTED_FDR}) | **{n_sig}** |
 
-        fig = px.scatter(fel_df, x='dnds', y='log10p',
-                         color='selected',
-                         color_discrete_map={True: T10[3], False: 'lightgrey'},
-                         title='FEL: dN/dS vs significance (−log₁₀ p)',
-                         labels={'dnds': 'dN/dS', 'log10p': '−log₁₀(p)', 'selected': 'Selected'},
-                         opacity=0.6)
-        fig.add_vline(x=1, line_dash='dash', line_color='grey')
-        fig.add_hline(y=-np.log10(0.05), line_dash='dash', line_color='grey')
+> **BUSTED** asks whether *any* branch×site in the gene experienced episodic positive selection.
+> Significant genes (and only those) proceed to site-level MEME.
+"""))
+
+    if bq_col:
+        fig = px.histogram(busted_df, x=bq_col, nbins=50,
+                           title='BUSTED: gene-level q-value distribution (BH-FDR)',
+                           labels={bq_col: 'q-value'},
+                           color_discrete_sequence=[T10[2]])
+        fig.add_vline(x=BUSTED_FDR, line_dash='dash', line_color='red',
+                      annotation_text=f'q={BUSTED_FDR}', annotation_position='top right')
+        fig.update_layout(bargap=0.05)
         show_fig(fig)
 
-    ishow(fel_df.sort_values(pval_col).head(100).reset_index(drop=True) if pval_col else fel_df.head(100),
-          caption="FEL: top sites by significance")
+    sort_col = bq_col or bp_col
+    ishow(busted_df.sort_values(sort_col).reset_index(drop=True) if sort_col
+          else busted_df.reset_index(drop=True),
+          caption="BUSTED gene-level results (sorted by q-value)")
+else:
+    display(Markdown("*BUSTED was not run (not in `hyphy_methods`). The MEME gate fell back to FUBAR-FDR sites.*"))
 ```
 
 ## MEME results
@@ -272,41 +308,58 @@ if not fel_df.empty:
 #| echo: false
 
 if has_meme:
-    pval_col_meme = next((c for c in meme_df.columns if 'p_meme' in c.lower() or 'p-value' in c.lower()), None)
+    pval_col_meme = next((c for c in meme_df.columns if c.lower() == 'p_meme'), None) \
+                    or next((c for c in meme_df.columns if 'p_meme' in c.lower() or 'p-value' in c.lower()), None)
+    qval_col_meme = next((c for c in meme_df.columns if c.lower() == 'meme_qval'), None)
+    sig_col_meme  = next((c for c in meme_df.columns if 'is_meme_sig' in c.lower()), None)
+    testable_col  = next((c for c in meme_df.columns if c.lower() == 'testable'), None)
     gene_col_meme = next((c for c in meme_df.columns if 'gene' in c.lower()), meme_df.columns[0])
 
-    sig = meme_df[meme_df[pval_col_meme] <= 0.05] if pval_col_meme else pd.DataFrame()
+    # Significant = BH-FDR call from the aggregator (already excludes degenerate sites).
+    if sig_col_meme:
+        sig = meme_df[meme_df[sig_col_meme] == 1]
+    elif qval_col_meme:
+        sig = meme_df[pd.to_numeric(meme_df[qval_col_meme], errors='coerce') <= MEME_FDR]
+    else:
+        sig = meme_df[meme_df[pval_col_meme] <= 0.05] if pval_col_meme else pd.DataFrame()
+
     n_sig_sites = len(sig)
     n_sig_genes = sig[gene_col_meme].nunique() if not sig.empty else 0
+    n_testable  = int(meme_df[testable_col].sum()) if testable_col else len(meme_df)
+    n_dropped   = len(meme_df) - n_testable
 
     display(Markdown(f"""
 | Metric | Value |
 |--------|-------|
 | Sites tested by MEME | **{len(meme_df):,}** |
-| Sites with p ≤ 0.05 (episodic positive selection) | **{n_sig_sites:,}** |
+| Testable after guards (dS > 0, β⁺ in-bound) | **{n_testable:,}** ({n_dropped:,} dropped) |
+| Sites significant at BH-FDR ≤ {MEME_FDR} | **{n_sig_sites:,}** |
 | Genes with ≥1 MEME-significant site | **{n_sig_genes}** |
 
-> **MEME** detects *episodic* positive selection: sites where a subset of branches experienced dN > dS (LRT p ≤ 0.05).
+> **MEME** detects *episodic* positive selection per site. Significance here is **BH-FDR ≤ {MEME_FDR}**, not the raw
+> per-site LRT p — and sites with dS = 0 (saturation) or β⁺ pinned at the optimiser boundary are excluded before
+> correction, since both manufacture spurious hits.
 """))
 
-    if pval_col_meme:
-        fig = px.histogram(meme_df, x=pval_col_meme, nbins=50,
-                           title='MEME: distribution of site-level p-values',
-                           labels={pval_col_meme: 'p-value (LRT)'},
+    if qval_col_meme:
+        qnum = pd.to_numeric(meme_df[qval_col_meme], errors='coerce').dropna()
+        fig = px.histogram(qnum, nbins=50,
+                           title='MEME: site-level q-value distribution (BH-FDR, testable sites)',
+                           labels={'value': 'q-value'},
                            color_discrete_sequence=[T10[1]])
-        fig.add_vline(x=0.05, line_dash='dash', line_color='red',
-                      annotation_text='p=0.05', annotation_position='top right')
-        fig.update_layout(bargap=0.05)
+        fig.add_vline(x=MEME_FDR, line_dash='dash', line_color='red',
+                      annotation_text=f'q={MEME_FDR}', annotation_position='top right')
+        fig.update_layout(bargap=0.05, showlegend=False)
         show_fig(fig)
 
     # Genes ranked by number of MEME-significant sites
-    if pval_col_meme and not sig.empty:
+    if not sig.empty:
         gene_counts = sig.groupby(gene_col_meme).size().reset_index(name='n_meme_sig_sites')
         gene_counts = gene_counts.sort_values('n_meme_sig_sites', ascending=False)
         top_meme = gene_counts.head(40)
         fig2 = px.bar(top_meme, x='n_meme_sig_sites', y=gene_col_meme,
                       orientation='h',
-                      title='Top genes by MEME-significant sites (p ≤ 0.05)',
+                      title=f'Top genes by MEME-significant sites (BH-FDR ≤ {MEME_FDR})',
                       labels={'n_meme_sig_sites': 'Sites with episodic positive selection',
                               gene_col_meme: 'Gene'},
                       color='n_meme_sig_sites', color_continuous_scale='Oranges')
@@ -314,11 +367,65 @@ if has_meme:
                            height=max(400, len(top_meme) * 22))
         show_fig(fig2)
 
-    ishow(meme_df.sort_values(pval_col_meme).head(500).reset_index(drop=True) if pval_col_meme
+    sort_col_meme = qval_col_meme or pval_col_meme
+    ishow(sig.sort_values(sort_col_meme).head(500).reset_index(drop=True) if (not sig.empty and sort_col_meme)
           else meme_df.head(500).reset_index(drop=True),
-          caption="MEME sites (sorted by p-value, up to 500 rows)")
+          caption=f"MEME-significant sites (BH-FDR ≤ {MEME_FDR}, up to 500 rows)")
 else:
-    display(Markdown("*MEME was not run (no genes exceeded the FUBAR site threshold), or results not provided.*"))
+    display(Markdown("*MEME was not run (no genes passed the BUSTED gate), or results not provided.*"))
+```
+
+## Consensus: pervasive (FUBAR) × episodic (BUSTED / MEME)
+
+```{python}
+#| label: consensus
+#| echo: false
+
+# Per-gene convergence of the three signals. FUBAR is pervasive; BUSTED/MEME are
+# episodic. Genes flagged by both kinds of test are the most defensible calls.
+if not fubar_df.empty:
+    gcol = next((c for c in fubar_df.columns if 'gene' in c.lower()), fubar_df.columns[0])
+    cons = fubar_df[[gcol]].copy()
+    cons['fubar_pos_fdr_sites'] = fubar_df[pos_fdr_col] if pos_fdr_col else 0
+    cons['fubar_positive']      = cons['fubar_pos_fdr_sites'] > 0
+
+    cons['busted_sig'] = cons[gcol].isin(busted_sig_genes) if busted_sig_genes else False
+
+    if has_meme and 'sig' in dir() and not sig.empty:
+        meme_counts = sig.groupby(gene_col_meme).size()
+        cons['meme_sig_sites'] = cons[gcol].map(meme_counts).fillna(0).astype(int)
+    else:
+        cons['meme_sig_sites'] = 0
+    cons['meme_sig'] = cons['meme_sig_sites'] > 0
+
+    # Consensus = pervasive AND episodic evidence
+    cons['consensus'] = cons['fubar_positive'] & (cons['busted_sig'] | cons['meme_sig'])
+    consensus_genes = cons[cons['consensus']].sort_values(
+        ['meme_sig_sites', 'fubar_pos_fdr_sites'], ascending=False)
+
+    n_fubar_pos  = int(cons['fubar_positive'].sum())
+    n_busted     = int(cons['busted_sig'].sum())
+    n_meme       = int(cons['meme_sig'].sum())
+    n_consensus  = int(cons['consensus'].sum())
+
+    display(Markdown(f"""
+| Signal | Genes |
+|--------|-------|
+| FUBAR-positive (Bayesian FDR ≤ {FUBAR_FDR}) | **{n_fubar_pos}** |
+| BUSTED-significant (BH-FDR ≤ {BUSTED_FDR}) | **{n_busted}** |
+| MEME-significant (≥1 site, BH-FDR ≤ {MEME_FDR}) | **{n_meme}** |
+| **Consensus** (pervasive **and** episodic) | **{n_consensus}** |
+
+> Consensus genes carry both pervasive (FUBAR) and episodic (BUSTED/MEME) support — the strongest candidates.
+"""))
+
+    if not consensus_genes.empty:
+        ishow(consensus_genes.reset_index(drop=True),
+              caption="Consensus genes: FUBAR-positive AND BUSTED/MEME-significant")
+    else:
+        display(Markdown("*No genes reached consensus across pervasive and episodic tests.*"))
+else:
+    display(Markdown("*FUBAR results unavailable — consensus table skipped.*"))
 ```
 
 ## Variability vs positive selection

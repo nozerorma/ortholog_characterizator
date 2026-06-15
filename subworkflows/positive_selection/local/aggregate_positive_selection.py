@@ -69,6 +69,31 @@ def load_gene_map(map_dir, gene):
 
 
 # ---------------------------------------------------------------------------
+# BUSTED results loader (for sel_variability join)
+# ---------------------------------------------------------------------------
+
+def load_busted_lookup(busted_tsv):
+    """Return {gene: (busted_qval, is_busted_sig)} from a busted_results.tsv.
+    Empty dict if the file is absent/empty (so the join degrades gracefully)."""
+    if not busted_tsv or not os.path.isfile(busted_tsv) or os.path.getsize(busted_tsv) == 0:
+        return {}
+    out = {}
+    with open(busted_tsv) as fh:
+        hdr = fh.readline().rstrip('\n').split('\t')
+        gi = hdr.index('gene') if 'gene' in hdr else 0
+        qi = hdr.index('busted_qval') if 'busted_qval' in hdr else None
+        si = hdr.index('is_busted_sig') if 'is_busted_sig' in hdr else None
+        for line in fh:
+            p = line.rstrip('\n').split('\t')
+            if len(p) <= gi:
+                continue
+            q = p[qi] if (qi is not None and qi < len(p)) else 'NA'
+            s = p[si] if (si is not None and si < len(p)) else 'NA'
+            out[p[gi]] = (q, s)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # FUBAR parser
 # ---------------------------------------------------------------------------
 
@@ -361,6 +386,9 @@ def main():
                              '(skips re-parsing FUBAR JSONs; used in AGGREGATE_FINAL)')
     parser.add_argument('--variability_tsv', default=None,
                         help='gene_variability.tsv to join with FUBAR gene-level results')
+    parser.add_argument('--busted_tsv', default=None,
+                        help='busted_results.tsv to fold into the sel_variability join '
+                             '(adds busted_qval, is_busted_sig per gene)')
     parser.add_argument('--map_dir', default=None,
                         help='Directory of *.map.tsv BMGE position maps; when provided, '
                              'site-level outputs gain ori_codon_col, hg38_aa_pos, hg38_nt_coord columns')
@@ -437,19 +465,23 @@ def main():
                 for line in fh:
                     parts = line.rstrip().split('\t')
                     if parts:
-                        var_data[parts[0]] = dict(zip(header[1:], parts[1:]))
+                        key = parts[0].removesuffix('.prot')
+                        var_data[key] = dict(zip(header[1:], parts[1:]))
 
+            busted_lookup = load_busted_lookup(args.busted_tsv)
             sv_path = os.path.join(args.out_dir, 'sel_variability.tsv')
             var_cols = ['n_seqs', 'n_positions', 'mean_variability',
                         'mean_gap_fraction', 'pct_high_gap']
             with open(sv_path, 'w') as fh:
-                fh.write('gene\tn_pos_sites\tn_neg_sites\tmax_posterior\tmean_posterior\t' +
-                         '\t'.join(var_cols) + '\n')
+                fh.write('gene\tn_pos_sites\tn_pos_sites_fdr\tn_neg_sites\tmax_posterior\tmean_posterior\t'
+                         'busted_qval\tis_busted_sig\t' + '\t'.join(var_cols) + '\n')
                 for r in sorted(fubar_rows, key=lambda x: -x['n_pos_sites']):
                     vr = var_data.get(r['gene'], {})
                     vcols = '\t'.join(vr.get(c, 'NA') for c in var_cols)
-                    fh.write(f"{r['gene']}\t{r['n_pos_sites']}\t{r['n_neg_sites']}\t"
-                             f"{r['max_posterior']}\t{r['mean_posterior']}\t{vcols}\n")
+                    bq, bs = busted_lookup.get(r['gene'], ('NA', 'NA'))
+                    fh.write(f"{r['gene']}\t{r['n_pos_sites']}\t{r.get('n_pos_sites_fdr', 'NA')}\t"
+                             f"{r['n_neg_sites']}\t{r['max_posterior']}\t{r['mean_posterior']}\t"
+                             f"{bq}\t{bs}\t{vcols}\n")
             print(f'Written: {sv_path}', flush=True)
 
     # ── FEL ───────────────────────────────────────────────────────────────────
@@ -596,7 +628,8 @@ def main():
             for line in fh:
                 parts = line.rstrip().split('\t')
                 if parts:
-                    var_data[parts[0]] = dict(zip(header[1:], parts[1:]))
+                    key = parts[0].removesuffix('.prot')
+                    var_data[key] = dict(zip(header[1:], parts[1:]))
 
         fubar_rows = []
         with open(args.fubar_tsv) as fh:
@@ -606,17 +639,20 @@ def main():
                 if parts:
                     fubar_rows.append(dict(zip(hdr, parts)))
 
+        busted_lookup = load_busted_lookup(args.busted_tsv)
         sv_path = os.path.join(args.out_dir, 'sel_variability.tsv')
         var_cols = ['n_seqs', 'n_positions', 'mean_variability',
                     'mean_gap_fraction', 'pct_high_gap']
         with open(sv_path, 'w') as fh:
-            fh.write('gene\tn_pos_sites\tn_neg_sites\tmax_posterior\tmean_posterior\t' +
-                     '\t'.join(var_cols) + '\n')
+            fh.write('gene\tn_pos_sites\tn_pos_sites_fdr\tn_neg_sites\tmax_posterior\tmean_posterior\t'
+                     'busted_qval\tis_busted_sig\t' + '\t'.join(var_cols) + '\n')
             for r in sorted(fubar_rows, key=lambda x: -int(x.get('n_pos_sites', 0))):
                 vr = var_data.get(r['gene'], {})
                 vcols = '\t'.join(vr.get(c, 'NA') for c in var_cols)
-                fh.write(f"{r['gene']}\t{r['n_pos_sites']}\t{r['n_neg_sites']}\t"
-                         f"{r['max_posterior']}\t{r['mean_posterior']}\t{vcols}\n")
+                bq, bs = busted_lookup.get(r['gene'], ('NA', 'NA'))
+                fh.write(f"{r['gene']}\t{r['n_pos_sites']}\t{r.get('n_pos_sites_fdr', 'NA')}\t"
+                         f"{r['n_neg_sites']}\t{r['max_posterior']}\t{r['mean_posterior']}\t"
+                         f"{bq}\t{bs}\t{vcols}\n")
         print(f'Written: {sv_path}', flush=True)
 
 

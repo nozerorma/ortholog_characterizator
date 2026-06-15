@@ -260,12 +260,20 @@ workflow {
                ? Channel.value(file(params.sel_variability_tsv))
                : Channel.empty())
 
+        def meme_report_ch = params.run_positive_selection
+            ? POSITIVE_SELECTION.out.meme_tsv
+            : Channel.empty()
+
         def ucr_windows_report_ch = (params.run_variability && params.run_ucr)
             ? UCR_ANALYSIS.out.ucr_windows_tsv
             : Channel.empty()
 
         def ucr_positions_report_ch = (params.run_variability && params.run_ucr)
             ? UCR_ANALYSIS.out.ucr_positions_tsv
+            : Channel.empty()
+
+        def ucr_clade_var_report_ch = (params.run_variability && params.run_ucr)
+            ? UCR_ANALYSIS.out.ucr_clade_variability
             : Channel.empty()
 
         VARIABILITY_REPORT(
@@ -278,8 +286,10 @@ workflow {
             VARIABILITY.out.prot_files,
             VARIABILITY.out.domain_tsv,
             sel_var_report_ch,
+            meme_report_ch,
             ucr_windows_report_ch,
-            ucr_positions_report_ch
+            ucr_positions_report_ch,
+            ucr_clade_var_report_ch
         )
     }
 
@@ -293,7 +303,7 @@ workflow {
         PSEL_REPORT(
             POSITIVE_SELECTION.out.fubar_tsv,
             POSITIVE_SELECTION.out.fubar_sites,
-            POSITIVE_SELECTION.out.fel_tsv,
+            POSITIVE_SELECTION.out.busted_tsv,
             POSITIVE_SELECTION.out.meme_tsv,
             gene_var_report_ch.ifEmpty(file('NO_GENE_VAR'))
         )

@@ -6,7 +6,7 @@ Scans a directory of FASTA alignment files and outputs a TSV with two columns:
   assembly_name   n_genes
 
 Usage:
-    python count_assembly_genes.py -d <cds_dir> -o <out.tsv>
+    python count_genes.py -d <cds_dir> -o <out.tsv>
 """
 
 import argparse
@@ -15,7 +15,7 @@ import os
 from collections import defaultdict
 
 
-def count_assembly_genes(fasta_dir: str) -> dict[str, int]:
+def count_genes(fasta_dir: str) -> dict[str, int]:
     counts: dict[str, int] = defaultdict(int)
     for fname in sorted(os.listdir(fasta_dir)):
         if not (fname.endswith(".fa") or fname.endswith(".fasta")):
@@ -42,7 +42,7 @@ def main():
                         help="Output TSV (assembly_name, n_genes)")
     args = parser.parse_args()
 
-    counts = count_assembly_genes(args.dir)
+    counts = count_genes(args.dir)
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w", newline="") as fh:

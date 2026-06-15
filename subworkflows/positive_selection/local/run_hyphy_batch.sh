@@ -50,18 +50,22 @@ run_hyphy_gene() {
     # not prune the FASTA to match the tree — species absent from the
     # species tree remain in the FASTA, causing HyPhy tip-count mismatches.
     local filtered_fasta="${gene_id}.tree_filtered.fa"
+    local matched_tree="${gene_id}.matched.nwk"
     local taxid_arg=""
     [[ -n "$taxid_tsv" ]] && taxid_arg="--taxid-tsv $taxid_tsv"
 
     if ! python3 "$filter_fasta" \
-            --fasta "$fasta" \
-            --tree  "$tree" \
-            --out   "$filtered_fasta" \
+            --fasta    "$fasta" \
+            --tree     "$tree" \
+            --out      "$filtered_fasta" \
+            --out-tree "$matched_tree" \
             $taxid_arg 2>&1; then
         echo "[HYPHY] WARN: FASTA filtering failed for ${gene_id}, skipping" >&2
         return
     fi
     fasta="$filtered_fasta"
+    # Use the re-pruned tree so tree tips == sequences (required by MEME's GTR fit).
+    [[ -s "$matched_tree" ]] && tree="$matched_tree"
 
     # Cap BLAS/OpenMP threads to the per-worker CPU allocation.
     # HyPhy's CPU argument only controls its own scheduler; library-level

@@ -64,6 +64,80 @@ def get_leaf_names(newick_str):
     return set(re.findall(r'[^\s(),;]+', s))
 
 
+# ── Minimal Newick parser / pruner (for --out-tree) ───────────────────────────
+
+class _Node:
+    __slots__ = ('name', 'length', 'children')
+
+    def __init__(self, name='', length=None, children=None):
+        self.name = name
+        self.length = length
+        self.children = children or []
+
+    def is_leaf(self):
+        return not self.children
+
+
+def parse_newick(s):
+    s = s.strip().rstrip(';')
+    pos = [0]
+
+    def parse_node():
+        node = _Node()
+        if pos[0] < len(s) and s[pos[0]] == '(':
+            pos[0] += 1
+            node.children.append(parse_node())
+            while pos[0] < len(s) and s[pos[0]] == ',':
+                pos[0] += 1
+                node.children.append(parse_node())
+            if pos[0] < len(s) and s[pos[0]] == ')':
+                pos[0] += 1
+        label_start = pos[0]
+        while pos[0] < len(s) and s[pos[0]] not in (',', ')', ':', ';'):
+            pos[0] += 1
+        node.name = s[label_start:pos[0]]
+        if pos[0] < len(s) and s[pos[0]] == ':':
+            pos[0] += 1
+            bl_start = pos[0]
+            while pos[0] < len(s) and s[pos[0]] not in (',', ')', ';'):
+                pos[0] += 1
+            try:
+                node.length = float(s[bl_start:pos[0]])
+            except ValueError:
+                node.length = None
+        return node
+
+    return parse_node()
+
+
+def to_newick(node):
+    if node.is_leaf():
+        out = node.name
+    else:
+        out = '(' + ','.join(to_newick(c) for c in node.children) + ')' + node.name
+    if node.length is not None:
+        out += f':{node.length}'
+    return out
+
+
+def prune_tree(node, keep):
+    """Retain only leaves in `keep`; collapse single-child nodes. None if empty."""
+    if node.is_leaf():
+        return node if node.name in keep else None
+    surviving = []
+    for child in node.children:
+        p = prune_tree(child, keep)
+        if p is not None:
+            surviving.append(p)
+    if not surviving:
+        return None
+    if len(surviving) == 1:
+        surviving[0].length = node.length
+        return surviving[0]
+    node.children = surviving
+    return node
+
+
 # ── FASTA reader ──────────────────────────────────────────────────────────────
 
 def read_fasta(path):
@@ -89,18 +163,24 @@ def main():
     ap.add_argument('--fasta',     required=True)
     ap.add_argument('--tree',      required=True)
     ap.add_argument('--out',       required=True)
+    ap.add_argument('--out-tree',  default=None,
+                    help='Write a tree pruned to exactly the kept leaves. HyPhy aborts '
+                         '(notably MEME\'s GTR pre-fit) when tree tips != sequences, so the '
+                         'tree must be re-pruned to match the filtered FASTA.')
     ap.add_argument('--taxid-tsv', default=None,
                     help='taxid_species_family.tsv for synonym → tree-name resolution')
     args = ap.parse_args()
 
     with open(args.tree) as fh:
-        leaves = get_leaf_names(fh.read())
+        tree_text = fh.read()
+    leaves = get_leaf_names(tree_text)
 
     name_to_taxid = taxid_to_names = None
     if args.taxid_tsv:
         name_to_taxid, taxid_to_names = build_taxid_lookup(args.taxid_tsv)
 
     kept, dropped, renamed = 0, 0, 0
+    kept_leaves = set()
     with open(args.out, 'w') as fh:
         for header, seq in read_fasta(args.fasta):
             sid = header.split()[0]
@@ -110,7 +190,9 @@ def main():
             else:
                 tree_name = sid if sid in leaves else None
 
-            if tree_name is None:
+            if tree_name is None or tree_name in kept_leaves:
+                # No tree match, or a second FASTA seq collapsing onto the same
+                # tree leaf (would create duplicate tips) — drop it.
                 dropped += 1
                 continue
 
@@ -120,7 +202,17 @@ def main():
                 renamed += 1
 
             fh.write(f'>{header}\n{seq}\n')
+            kept_leaves.add(tree_name)
             kept += 1
+
+    # Prune the tree to exactly the kept leaves so HyPhy sees matching tip/seq counts.
+    if args.out_tree:
+        pruned = prune_tree(parse_newick(tree_text), kept_leaves)
+        if pruned is None:
+            print(f'ERROR: no tree leaves survive pruning to filtered FASTA', file=sys.stderr)
+            sys.exit(1)
+        with open(args.out_tree, 'w') as fh:
+            fh.write(to_newick(pruned) + ';\n')
 
     if dropped:
         print(f'[FILTER] {args.fasta}: kept {kept}, dropped {dropped} (no tree match)',

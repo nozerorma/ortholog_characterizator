@@ -28,7 +28,8 @@ SLURM_LOG_DIR="${NF_DIR}/Slurm"
 CDS_DIR="${ROOT}/alignments/Primates_cds"
 
 # ── Reference / metadata files ───────────────────────────────────────────────
-ASSEMBLIES_TSV="${ROOT}/taxa_info/assemblies_and_species_mammals.tsv"
+# PPGA does not deduplicate assemblies, so the assembly metadata TSV is not required.
+ASSEMBLIES_TSV=""
 SPECIES_DEDUP_MAP="${ROOT}/taxa_info/species_dedup_map.tsv"
 TAXID_TSV="${ROOT}/taxa_info/taxid_species_family_primates.tsv"
 FAMILY_ORDER_TSV="${ROOT}/taxa_info/family_to_order.tsv"
@@ -62,6 +63,9 @@ RUN_PHYLOGENY=false
 RUN_POSITIVE_SELECTION=true
 RUN_UCR=true             # Ultra-Conserved Region analysis (requires RUN_VARIABILITY=true)
 
+# PPGA keeps the raw assembly headers through quality filtering; no assembly-level deduplication.
+RUN_DEDUP=false
+
 # Auto-disable quality + translation when pre-computed inputs are provided
 if [[ -n "$PROT_DIR" || -n "$TRIM_DIR" || -n "$DEDUP_DIR" ]]; then
     RUN_QUALITY=false
@@ -86,21 +90,46 @@ BMGE_GAP_THRESH="0.1"         # -g: max gap rate allowed per column; 0.0 = remov
 BMGE_ENTROPY_THRESH="0.5"     # -h: max entropy score; 1.0 = no trimming
 
 # ── Test mode: run on a random subset of TEST_N_GENES genes ──────────────────
-TEST_MODE=false
-TEST_N_GENES=200
+TEST_MODE=true
+TEST_N_GENES=100
+
+# ── Concurrency: per-gene batch sizing (scales with dataset size) ────────────
+# Heavy per-gene stages run batched: each batch is ONE SLURM job that processes
+# BATCH_SIZE genes, BATCH_WORKERS at a time in parallel. Small batches in test mode
+# → quick turnaround and fine-grained parallelism on a few hundred genes; large
+# batches in full mode → ~16k genes do not spawn thousands of scheduler jobs.
+# WORKERS is capped per stage by its CPU allocation in conf/resources.config
+# (batch_light=8, batch_heavy=16 cpus).
+#
+# HyPhy is sized SEPARATELY: FUBAR+BUSTED (first pass) and MEME (second pass) are
+# far heavier per gene than the alignment/variability stages, and MEME is the
+# pipeline bottleneck — so it gets its own batch/worker knobs.
+if [[ "$TEST_MODE" == "true" ]]; then
+    BATCH_SIZE=16;       BATCH_WORKERS=4        # dedup / filter / BMGE / variability
+    PSEL_BATCH_SIZE=8;   PSEL_BATCH_WORKERS=4   # HyPhy (FUBAR/BUSTED/MEME)
+else
+    BATCH_SIZE=96;       BATCH_WORKERS=6
+    PSEL_BATCH_SIZE=48;  PSEL_BATCH_WORKERS=8
+fi
 
 # ── Optional: restrict to a gene list ────────────────────────────────────────
 GENE_LIST=""    # path to plain-text file (one gene name per line); leave empty for all
 
 # ── Positive selection ────────────────────────────────────────────────────────
-PSEL_SPECIES_TREE="${ROOT}/external_phylogenies/primates_233_fossil-cal.tree"          # /path/to/species_tree.nwk — required when RUN_POSITIVE_SELECTION=true
-HYPHY_METHODS="FUBAR"         # FUBAR | FUBAR,FEL | FUBAR,FEL,MEME | FUBAR,FEL,SLAC
+PSEL_SPECIES_TREE="${ROOT}/external_phylogenies/primates_233_subst.tree"          # subst/site branch lengths (NOT the fossil-cal timetree: its MY branch lengths overflow HyPhy MEME's rate*length domain) — required when RUN_POSITIVE_SELECTION=true
+HYPHY_METHODS="FUBAR,BUSTED"  # first-pass methods. BUSTED is the gene-level gate that decides
+                              # which genes get site-level MEME (2nd pass). FEL/SLAC also available.
 FUBAR_THRESHOLD="0.9"         # posterior probability threshold for positive sites
 
 # ── Variability / Pfam ────────────────────────────────────────────────────────
 RUN_HMMSCAN=true              # true | false — run hmmscan against Pfam-A.hmm
 PFAM_HMM="${ROOT}/pfam/Pfam-A.hmm"           # path to Pfam-A.hmm (used when RUN_HMMSCAN=true)
-PFAM_DESC_TSV="${ROOT}/taxa_info/pfam_descriptions.tsv"  # pfam ID → description table
+PFAM_DESC_TSV="${ROOT}/pfam/pfam_descriptions.tsv"  # pfam ID → description table
+
+# ── Genomic coordinate mapping ────────────────────────────────────────────────
+ALI_REF="/homes/users/mramon/scratch/4.Generate_alignments_from_codons/ali_ref/ppga"
+GFF_FILE="${ALI_REF}/Homo_sapiens.sorted.gff"
+GENE_EQUIV_TSV="${ALI_REF}/proteiID_gene_equivalences.txt"
 
 # ── UCR analysis (active only when RUN_UCR=true and RUN_VARIABILITY=true) ─────
 # Detection thresholds — leave empty to keep pipeline defaults (see variability.config).
@@ -130,6 +159,13 @@ NF_OPTIONAL=""
 [[ -n "$MIN_SEQS"               ]] && NF_OPTIONAL+=" --min_seqs $MIN_SEQS"
 [[ -f "$FAMILY_ORDER_TSV"       ]] && NF_OPTIONAL+=" --family_order_tsv $FAMILY_ORDER_TSV"
 [[ "$TEST_MODE" == "true"       ]] && NF_OPTIONAL+=" --test_mode true --test_n_genes $TEST_N_GENES"
+# Batch concurrency — one global pair scales every batched stage (overrides conf/*.config)
+NF_OPTIONAL+=" --run_dedup $RUN_DEDUP"
+NF_OPTIONAL+=" --dedup_batch_size $BATCH_SIZE --dedup_batch_workers $BATCH_WORKERS"
+NF_OPTIONAL+=" --filter_batch_size $BATCH_SIZE --filter_batch_workers $BATCH_WORKERS"
+NF_OPTIONAL+=" --translation_batch_size $BATCH_SIZE --translation_batch_workers $BATCH_WORKERS"
+NF_OPTIONAL+=" --variability_batch_size $BATCH_SIZE --variability_batch_workers $BATCH_WORKERS"
+NF_OPTIONAL+=" --psel_batch_size $PSEL_BATCH_SIZE --psel_batch_workers $PSEL_BATCH_WORKERS"
 [[ -n "$PSEL_SPECIES_TREE"      ]] && NF_OPTIONAL+=" --psel_species_tree $PSEL_SPECIES_TREE"
 [[ -n "$IQTREE_MSET"            ]] && NF_OPTIONAL+=" --iqtree_mset $IQTREE_MSET"
 [[ -n "$HYPHY_METHODS"          ]] && NF_OPTIONAL+=" --hyphy_methods $HYPHY_METHODS"
@@ -139,6 +175,11 @@ NF_OPTIONAL=""
 [[ "$RUN_HMMSCAN" == "true"     ]] && NF_OPTIONAL+=" --run_hmmscan true"
 [[ "$RUN_HMMSCAN" == "true" && -n "$PFAM_HMM"      ]] && NF_OPTIONAL+=" --pfam_hmm $PFAM_HMM"
 [[ -f "$PFAM_DESC_TSV"          ]] && NF_OPTIONAL+=" --pfam_descriptions_tsv $PFAM_DESC_TSV"
+[[ -n "$GFF_FILE"               ]] && NF_OPTIONAL+=" --gff_file $GFF_FILE"
+[[ -n "$GENE_EQUIV_TSV"         ]] && NF_OPTIONAL+=" --gene_equiv_tsv $GENE_EQUIV_TSV"
+# DEDUP-specific metadata is only needed when deduplication is enabled.
+[[ "$RUN_DEDUP" == "true"      ]] && NF_OPTIONAL+=" --assemblies_tsv $ASSEMBLIES_TSV"
+[[ "$RUN_DEDUP" == "true"      ]] && NF_OPTIONAL+=" --species_dedup_map $SPECIES_DEDUP_MAP"
 # UCR thresholds (only passed when non-empty, so defaults in variability.config apply otherwise)
 [[ -n "$UCR_ABS_THRESHOLD"      ]] && NF_OPTIONAL+=" --ucr_abs_threshold $UCR_ABS_THRESHOLD"
 [[ -n "$UCR_ABS_MIN_LEN"        ]] && NF_OPTIONAL+=" --ucr_abs_min_len $UCR_ABS_MIN_LEN"
@@ -190,8 +231,6 @@ nextflow run "${NF_DIR}/main.nf" \\
     -with-tower \\
     --cds_dir                "${CDS_DIR}" \\
     --out_dir                "${OUT_DIR}" \\
-    --assemblies_tsv         "${ASSEMBLIES_TSV}" \\
-    --species_dedup_map      "${SPECIES_DEDUP_MAP}" \\
     --taxid_tsv              "${TAXID_TSV}" \\
     --run_quality            "${RUN_QUALITY}" \\
     --run_translation        "${RUN_TRANSLATION}" \\
