@@ -1,6 +1,6 @@
-# generate-alis
+# Ortholog Characterizator
 
-Nextflow pipeline for mammalian CDS alignment processing, variability analysis, and positive selection detection.
+Nextflow pipeline for ortholog CDS characterization, variability analysis, and positive selection detection. Tested in primate ortholog codon CDS set and in [TOGA 2 Multi Codon Alignments][https://genome.senckenberg.de/download/TOGA2/MultiCodonAlignments/]
 
 Takes a directory of codon-level multiple sequence alignments (one `.fa` per gene) and runs them through up to six independent stages that can be toggled on or off.
 
