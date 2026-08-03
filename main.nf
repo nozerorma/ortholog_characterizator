@@ -85,10 +85,11 @@ def helpMessage() {
         --ucr_window_threshold     float (default: 0.85)  sliding window C_trident floor
         --ucr_flank_size           int   (default: 5)     flanking aa on each side
         --fubar_sites_tsv          path  (optional: fubar_sites.tsv from prior psel run)
-        --fel_results_tsv          path  (optional: fel_results.tsv from prior psel run)
 
     Positive selection options:
-        --hyphy_methods          FUBAR,FEL[,SLAC]  (default: FUBAR,FEL)
+        --run_fubar              true/false  (default: true)
+        --run_busted             true/false  (default: true; gene-level gate for MEME)
+        --run_meme               true/false  (default: true; requires run_busted or FUBAR sites)
         --psel_species_tree      path  (required)
         --fubar_threshold        float (default: 0.9)
         --sel_variability_tsv    path  (optional: sel_variability.tsv from a prior positive-selection run,
@@ -228,19 +229,12 @@ workflow {
                ? Channel.value(file(params.fubar_sites_tsv))
                : Channel.value(file('NO_FUBAR')))
 
-        def ucr_fel_ch = params.run_positive_selection
-            ? POSITIVE_SELECTION.out.fel_tsv
-            : (params.fel_results_tsv
-               ? Channel.value(file(params.fel_results_tsv))
-               : Channel.value(file('NO_FEL')))
-
         UCR_ANALYSIS(
             VARIABILITY.out.entropy_tsvs,
             ucr_prot_ch,
             ucr_map_ch,
             VARIABILITY.out.domain_tsv,
-            ucr_fubar_ch,
-            ucr_fel_ch
+            ucr_fubar_ch
         )
     }
 

@@ -90,9 +90,6 @@ process HYPHY_BATCH {
 
     output:
     tuple val(batch_id), path("*.FUBAR.json"),  optional: true, emit: fubar_json
-    tuple val(batch_id), path("*.FEL.json"),    optional: true, emit: fel_json
-    tuple val(batch_id), path("*.SLAC.json"),   optional: true, emit: slac_json
-    tuple val(batch_id), path("*.BUSTED.json"), optional: true, emit: busted_json
 
     script:
     def workers   = params.psel_batch_workers as int
@@ -107,7 +104,7 @@ MANIFEST_EOF
         --manifest    manifest.tsv \\
         --workers     ${workers} \\
         --cpu-each    ${cpu_each} \\
-        --methods     "${params.hyphy_methods}" \\
+        --methods     "FUBAR" \\
         --scripts-dir "${projectDir}/subworkflows/positive_selection/local" \\
         ${taxid_arg}
     """
@@ -118,27 +115,26 @@ process AGGREGATE_FIRST_PASS {
     publishDir "${params.out_dir}/reports/positive_selection", mode: 'copy'
 
     input:
-    path json_files   // all FUBAR/FEL JSON files collected into work dir
+    path json_files   // all FUBAR/BUSTED JSON files collected into work dir
     path map_files    // all *.map.tsv files (may be empty list)
+    val analyses_str
 
     output:
-    path "fubar_results.tsv",        emit: fubar_tsv
+    path "fubar_results.tsv",        optional: true, emit: fubar_tsv
     path "fubar_sites.tsv",          optional: true, emit: fubar_sites
-    path "fel_results.tsv",          optional: true, emit: fel_tsv
     path "busted_results.tsv",       optional: true, emit: busted_tsv
     path "meme_candidate_genes.txt", emit: meme_candidates
 
     script:
-    def methods   = params.hyphy_methods
+    def methods   = analyses_str
     def threshold = params.fubar_threshold
     def var_arg   = params.variability_tsv ? "--variability_tsv '${params.variability_tsv}'" : ''
     """
     # Arrange flat JSONs into PSEL/<gene>/ structure expected by aggregate script
     python3 - <<'PYEOF'
 import os, glob, re
-for f in (glob.glob("*.FUBAR.json") + glob.glob("*.FEL.json")
-          + glob.glob("*.SLAC.json") + glob.glob("*.BUSTED.json")):
-    m = re.match(r'^(.+?)\\.(?:FUBAR|FEL|SLAC|BUSTED)\\.json\$', f)
+for f in (glob.glob("*.FUBAR.json") + glob.glob("*.BUSTED.json")):
+    m = re.match(r'^(.+?)\\.(?:FUBAR|BUSTED)\\.json\$', f)
     if m:
         gene = m.group(1)
         os.makedirs(f"PSEL/{gene}", exist_ok=True)
@@ -170,6 +166,35 @@ PYEOF
 
     # Guarantee the candidate file exists even if no gene passed the gate
     [[ -f meme_candidate_genes.txt ]] || touch meme_candidate_genes.txt
+    """
+}
+
+process HYPHY_BUSTED_BATCH {
+    label 'process_batch_heavy'
+    publishDir "${params.out_dir}/PSEL", mode: 'copy', pattern: '*.BUSTED.json'
+
+    input:
+    tuple val(batch_id), val(manifest_text), path(fastas), path(trees)
+
+    output:
+    tuple val(batch_id), path("*.BUSTED.json"), optional: true, emit: busted_json
+
+    script:
+    def workers   = params.psel_batch_workers as int
+    def cpu_each  = Math.max(1, (task.cpus as int).intdiv(workers))
+    def taxid_arg = params.taxid_tsv ? "--taxid-tsv '${params.taxid_tsv}'" : ''
+    """
+    cat > manifest.tsv << 'MANIFEST_EOF'
+${manifest_text}
+MANIFEST_EOF
+
+    bash ${projectDir}/subworkflows/positive_selection/local/run_hyphy_batch.sh \\
+        --manifest    manifest.tsv \\
+        --workers     ${workers} \\
+        --cpu-each    ${cpu_each} \\
+        --methods     "BUSTED" \\
+        --scripts-dir "${projectDir}/subworkflows/positive_selection/local" \\
+        ${taxid_arg}
     """
 }
 
@@ -324,20 +349,34 @@ workflow HYPHY {
     // Split fasta_with_tree so both HYPHY and MEME can read from it independently
     fasta_with_tree
         .multiMap { gene_id, fa, tree ->
-            hyphy: tuple(gene_id, fa, tree)
-            meme:  tuple(gene_id, fa, tree)
+            hyphy:  tuple(gene_id, fa, tree)
+            busted: tuple(gene_id, fa, tree)
+            meme:   tuple(gene_id, fa, tree)
         }
         .set { fwt }
 
-    // Step 2: first-pass HyPhy (FUBAR + FEL [+ SLAC])
-    hyphy_batches_ch = make_psel_batches(fwt.hyphy, 'hyphy', batch_size)
-    HYPHY_BATCH( hyphy_batches_ch )
+    // Step 2: first-pass HyPhy site-level methods (FUBAR)
+    if (params.run_fubar) {
+        hyphy_batches_ch = make_psel_batches(fwt.hyphy, 'hyphy', batch_size)
+        HYPHY_BATCH( hyphy_batches_ch )
+        fubar_json_ch = HYPHY_BATCH.out.fubar_json.collect { it[1] }.flatten().ifEmpty([])
+    } else {
+        fubar_json_ch = Channel.empty()
+    }
+
+    // Step 2b: BUSTED gene-level test (separate process for independent caching)
+    if (params.run_busted) {
+        busted_batches_ch = make_psel_batches(fwt.busted, 'busted', batch_size)
+        HYPHY_BUSTED_BATCH( busted_batches_ch )
+        busted_json_ch = HYPHY_BUSTED_BATCH.out.busted_json
+            .collect { it[1] }.flatten().ifEmpty([])
+    } else {
+        busted_json_ch = Channel.empty()
+    }
 
     // Collect all JSON outputs for aggregation
-    all_first_pass_json = HYPHY_BATCH.out.fubar_json.collect { it[1] }.flatten()
-        .mix(HYPHY_BATCH.out.fel_json.collect { it[1] }.flatten())
-        .mix(HYPHY_BATCH.out.slac_json.collect { it[1] }.flatten().ifEmpty([]))
-        .mix(HYPHY_BATCH.out.busted_json.collect { it[1] }.flatten().ifEmpty([]))
+    all_first_pass_json = fubar_json_ch
+        .mix(busted_json_ch)
         .collect()
 
     // Collect all map TSVs as a flat list of files (empty list if no maps provided)
@@ -346,44 +385,55 @@ workflow HYPHY {
         .collect()
         .ifEmpty([])
 
+    def first_pass_methods = []
+    if (params.run_fubar)  first_pass_methods << 'FUBAR'
+    if (params.run_busted) first_pass_methods << 'BUSTED'
+    def analyses_str = first_pass_methods.join(',')
+
     // Step 3: aggregate first pass (with optional position maps)
-    AGGREGATE_FIRST_PASS( all_first_pass_json, all_map_files )
+    AGGREGATE_FIRST_PASS( all_first_pass_json, all_map_files, analyses_str )
 
-    // Step 4: conditional MEME on FUBAR-positive genes
-    meme_candidates_ch = AGGREGATE_FIRST_PASS.out.meme_candidates
-        .splitText()
-        .map { it.trim() }
-        .filter { it != '' }
+    // Step 4: conditional MEME on candidate genes (skipped when --run_meme false)
+    if (params.run_meme) {
+        meme_candidates_ch = AGGREGATE_FIRST_PASS.out.meme_candidates
+            .splitText()
+            .map { it.trim() }
+            .filter { it != '' }
 
-    meme_input = fwt.meme
-        .join(meme_candidates_ch.map { g -> tuple(g, true) }, by: 0)
-        .map { gene_id, fa, tree, _flag -> tuple(gene_id, fa, tree) }
+        meme_input = fwt.meme
+            .join(meme_candidates_ch.map { g -> tuple(g, true) }, by: 0)
+            .map { gene_id, fa, tree, _flag -> tuple(gene_id, fa, tree) }
 
-    meme_batches_ch = make_psel_batches(meme_input, 'meme', batch_size)
-    HYPHY_MEME_BATCH( meme_batches_ch )
+        meme_batches_ch = make_psel_batches(meme_input, 'meme', batch_size)
+        HYPHY_MEME_BATCH( meme_batches_ch )
 
-    // Canonical empty-safe collection: when no gene yields a MEME JSON the
-    // channel must still emit [] so AGGREGATE_FINAL fires (and produces
-    // sel_variability.tsv) instead of starving and never running.
-    all_meme_json = HYPHY_MEME_BATCH.out.meme_json
-        .map { it[1] }
-        .flatten()
-        .collect()
-        .ifEmpty([])
+        // Canonical empty-safe collection: when no gene yields a MEME JSON the
+        // channel must still emit [] so AGGREGATE_FINAL fires instead of starving.
+        all_meme_json = HYPHY_MEME_BATCH.out.meme_json
+            .map { it[1] }
+            .flatten()
+            .collect()
+            .ifEmpty([])
 
-    AGGREGATE_FINAL(
-        AGGREGATE_FIRST_PASS.out.fubar_tsv,
-        AGGREGATE_FIRST_PASS.out.busted_tsv.ifEmpty(file('NO_BUSTED')),
-        all_meme_json,
-        all_map_files,
-        gene_var_tsv_ch
-    )
+        AGGREGATE_FINAL(
+            AGGREGATE_FIRST_PASS.out.fubar_tsv.ifEmpty(file('NO_FUBAR')),
+            AGGREGATE_FIRST_PASS.out.busted_tsv.ifEmpty(file('NO_BUSTED')),
+            all_meme_json,
+            all_map_files,
+            gene_var_tsv_ch
+        )
+
+        meme_out_ch    = AGGREGATE_FINAL.out.meme_tsv.ifEmpty(file('NO_MEME'))
+        sel_var_out_ch = AGGREGATE_FINAL.out.sel_variability.ifEmpty(file('NO_SEL_VAR'))
+    } else {
+        meme_out_ch    = Channel.value(file('NO_MEME'))
+        sel_var_out_ch = Channel.value(file('NO_SEL_VAR'))
+    }
 
     emit:
-    fubar_tsv           = AGGREGATE_FIRST_PASS.out.fubar_tsv
+    fubar_tsv           = AGGREGATE_FIRST_PASS.out.fubar_tsv.ifEmpty(file('NO_FUBAR'))
     fubar_sites         = AGGREGATE_FIRST_PASS.out.fubar_sites.ifEmpty(file('NO_FUBAR_SITES'))
-    fel_tsv             = AGGREGATE_FIRST_PASS.out.fel_tsv.ifEmpty(file('NO_FEL'))
     busted_tsv          = AGGREGATE_FIRST_PASS.out.busted_tsv.ifEmpty(file('NO_BUSTED'))
-    meme_tsv            = AGGREGATE_FINAL.out.meme_tsv.ifEmpty(file('NO_MEME'))
-    sel_variability_tsv = AGGREGATE_FINAL.out.sel_variability.ifEmpty(file('NO_SEL_VAR'))
+    meme_tsv            = meme_out_ch
+    sel_variability_tsv = sel_var_out_ch
 }

@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-Aggregate HyPhy positive selection results (FUBAR + FEL + MEME) across genes.
+Aggregate HyPhy positive selection results (FUBAR + BUSTED + MEME) across genes.
 
-Reads PSEL/<gene>/<gene>.{FUBAR,FEL,MEME,SLAC}.json files, extracts key
+Reads PSEL/<gene>/<gene>.{FUBAR,BUSTED,MEME}.json files, extracts key
 statistics, and optionally joins with gene_variability.tsv.
 
 Outputs (written to --out_dir):
   fubar_results.tsv   One row per gene: n_pos_sites (posterior>=threshold),
                       n_pos_sites_fdr (empirical Bayesian FDR), max/mean_posterior
   fubar_sites.tsv     One row per gene×site; adds is_pos_hit_fdr (Bayesian FDR call)
-  fel_results.tsv     One row per gene×site with dN/dS and p-values
   busted_results.tsv  One row per gene: busted_pval, busted_qval (BH-FDR), is_busted_sig
   meme_results.tsv    One row per gene×site; adds testable (dS>0 & beta+ in-bound),
                       meme_qval (BH-FDR over testable sites), is_meme_sig
@@ -25,7 +24,7 @@ beta+ at the optimiser boundary are excluded before FDR as degenerate.
 Usage:
   python aggregate_positive_selection.py \
       --psel_dir OUT_DIR/PSEL \
-      --analyses FUBAR,FEL \
+      --analyses FUBAR \
       --out_dir  OUT_DIR/reports/positive_selection \
       [--fubar_threshold 0.9] \
       [--fubar_tsv OUT_DIR/reports/positive_selection/fubar_results.tsv] \
@@ -168,44 +167,6 @@ def parse_fubar(json_path, threshold=0.9):
 
 
 # ---------------------------------------------------------------------------
-# FEL parser
-# ---------------------------------------------------------------------------
-
-def parse_fel(json_path):
-    """Extract per-site dS, dN, p-value from a FEL JSON."""
-    try:
-        with open(json_path) as fh:
-            d = json.load(fh)
-    except Exception as e:
-        print(f'WARN {json_path}: {e}', file=sys.stderr)
-        return []
-
-    rows = []
-    try:
-        headers = _headers(d)
-        content = d['MLE']['content']['0']
-
-        try:
-            idx_alpha = headers.index('alpha')
-            idx_beta  = headers.index('beta')
-            idx_pval  = headers.index('p-value')
-        except ValueError:
-            idx_alpha, idx_beta, idx_pval = 0, 1, 4
-
-        for i, site in enumerate(content, 1):
-            rows.append({
-                'site':  i,
-                'dS':    round(float(site[idx_alpha]), 4),
-                'dN':    round(float(site[idx_beta]),  4),
-                'p_fel': round(float(site[idx_pval]),  6),
-            })
-    except (KeyError, TypeError, IndexError) as e:
-        print(f'WARN {json_path}: FEL parse error — {e}', file=sys.stderr)
-
-    return rows
-
-
-# ---------------------------------------------------------------------------
 # MEME parser
 # ---------------------------------------------------------------------------
 
@@ -249,36 +210,6 @@ def parse_meme(json_path):
             })
     except (KeyError, ValueError, TypeError, IndexError) as e:
         print(f'WARN {json_path}: MEME parse error — {e}', file=sys.stderr)
-
-    return rows
-
-
-# ---------------------------------------------------------------------------
-# SLAC parser
-# ---------------------------------------------------------------------------
-
-def parse_slac(json_path):
-    """Extract per-site dS, dN, p+ from a SLAC JSON."""
-    try:
-        with open(json_path) as fh:
-            d = json.load(fh)
-    except Exception as e:
-        print(f'WARN {json_path}: {e}', file=sys.stderr)
-        return []
-
-    rows = []
-    try:
-        by_site = d['MLE']['content']['0']
-        for i, site in enumerate(by_site, 1):
-            # SLAC columns: ES, EN, S, N, dS, dN, dS-dN, p+, p-
-            rows.append({
-                'site':    i,
-                'dS':      round(float(site[4]), 4),
-                'dN':      round(float(site[5]), 4),
-                'p_slac+': round(float(site[7]), 6),
-            })
-    except (KeyError, TypeError, IndexError) as e:
-        print(f'WARN {json_path}: SLAC parse error — {e}', file=sys.stderr)
 
     return rows
 
@@ -366,8 +297,8 @@ def main():
         description='Aggregate HyPhy positive selection results.')
     parser.add_argument('--psel_dir', required=True,
                         help='Directory containing PSEL/<gene>/ subdirectories')
-    parser.add_argument('--analyses', default='FUBAR,FEL',
-                        help='Comma-separated analyses to aggregate (default: FUBAR,FEL)')
+    parser.add_argument('--analyses', default='FUBAR',
+                        help='Comma-separated analyses to aggregate (default: FUBAR)')
     parser.add_argument('--out_dir', required=True, help='Output directory for TSVs')
     parser.add_argument('--fubar_threshold', type=float, default=0.9,
                         help='Posterior probability threshold for FUBAR positive site (default: 0.9)')
@@ -484,27 +415,6 @@ def main():
                              f"{bq}\t{bs}\t{vcols}\n")
             print(f'Written: {sv_path}', flush=True)
 
-    # ── FEL ───────────────────────────────────────────────────────────────────
-    if 'FEL' in analyses:
-        fel_path = os.path.join(args.out_dir, 'fel_results.tsv')
-        n_rows = 0
-        map_cols_header = '\tori_codon_col\thg38_aa_pos\thg38_nt_coord' if args.map_dir else ''
-        with open(fel_path, 'w') as fh:
-            fh.write(f'gene\tsite\tdS\tdN\tp_fel{map_cols_header}\n')
-            for gene in genes:
-                jp = os.path.join(args.psel_dir, gene, f'{gene}.FEL.json')
-                if not os.path.isfile(jp):
-                    continue
-                gene_map = load_gene_map(args.map_dir, gene) if args.map_dir else {}
-                for row in parse_fel(jp):
-                    map_cols = ''
-                    if args.map_dir:
-                        ori_col, hg38_aa, hg38_nt = gene_map.get(row['site'], ('NA', 'NA', 'NA'))
-                        map_cols = f'\t{ori_col}\t{hg38_aa}\t{hg38_nt}'
-                    fh.write(f"{gene}\t{row['site']}\t{row['dS']}\t{row['dN']}\t{row['p_fel']}{map_cols}\n")
-                    n_rows += 1
-        print(f'Written: {fel_path} ({n_rows} gene×site rows)', flush=True)
-
     # ── MEME ──────────────────────────────────────────────────────────────────
     if 'MEME' in analyses:
         # Buffer all sites: BH-FDR needs the full p-value set, and we only test
@@ -550,27 +460,6 @@ def main():
         print(f'Written: {meme_path} ({len(meme_rows)} gene×site rows; '
               f'{len(testable)} testable, {n_drop} dropped by guards; '
               f'{n_sig} significant at BH-FDR {args.meme_fdr})', flush=True)
-
-    # ── SLAC ──────────────────────────────────────────────────────────────────
-    if 'SLAC' in analyses:
-        slac_path = os.path.join(args.out_dir, 'slac_results.tsv')
-        n_rows = 0
-        map_cols_header = '\tori_codon_col\thg38_aa_pos\thg38_nt_coord' if args.map_dir else ''
-        with open(slac_path, 'w') as fh:
-            fh.write(f'gene\tsite\tdS\tdN\tp_slac+{map_cols_header}\n')
-            for gene in genes:
-                jp = os.path.join(args.psel_dir, gene, f'{gene}.SLAC.json')
-                if not os.path.isfile(jp):
-                    continue
-                gene_map = load_gene_map(args.map_dir, gene) if args.map_dir else {}
-                for row in parse_slac(jp):
-                    map_cols = ''
-                    if args.map_dir:
-                        ori_col, hg38_aa, hg38_nt = gene_map.get(row['site'], ('NA', 'NA', 'NA'))
-                        map_cols = f'\t{ori_col}\t{hg38_aa}\t{hg38_nt}'
-                    fh.write(f"{gene}\t{row['site']}\t{row['dS']}\t{row['dN']}\t{row['p_slac+']}{map_cols}\n")
-                    n_rows += 1
-        print(f'Written: {slac_path} ({n_rows} gene×site rows)', flush=True)
 
     # ── BUSTED (gene-level gate) ───────────────────────────────────────────────
     busted_sig_genes = None

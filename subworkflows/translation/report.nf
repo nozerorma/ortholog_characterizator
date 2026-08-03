@@ -70,16 +70,17 @@ process RENDER_TRANSLATION_REPORT {
 
     script:
     def filter_mode  = params.filter_mode        ?: 'chi2'
-    def assemblies   = params.assemblies_tsv     ?: ''
-    def taxid        = params.taxid_tsv          ?: ''
-    def fam_order    = params.family_order_tsv   ?: ''
-    def sp_tree      = params.psel_species_tree  ?: ''
-    def dedup_dir     = "${params.out_dir}/DEDUP"
-    def prefilter_dir = (filter_mode != 'none')
-                        ? "${params.out_dir}/PREFILTER/${filter_mode}"
-                        : ''
-    def trim_dir      = "${params.out_dir}/TRIM/bmge"
-    def gene_counts   = "${params.out_dir}/quality/gene_counts/gene_counts.tsv"
+    def assemblies   = params.assemblies_tsv     ? file(params.assemblies_tsv)    : ''
+    def taxid        = params.taxid_tsv          ? file(params.taxid_tsv)         : ''
+    def fam_order    = params.family_order_tsv   ? file(params.family_order_tsv)  : ''
+    def sp_tree      = params.psel_species_tree  ? file(params.psel_species_tree) : ''
+    // quarto renders inside this process's work dir, so a relative out_dir
+    // (the "results" default) would not resolve and the stage would silently
+    // vanish from the report. file() yields an absolute path either way.
+    def dedup_dir     = file("${params.out_dir}/DEDUP")
+    def prefilter_dir = (filter_mode != 'none') ? file("${params.out_dir}/PREFILTER/${filter_mode}") : ''
+    def trim_dir      = file("${params.out_dir}/TRIM/bmge")
+    def gene_counts   = file("${params.out_dir}/quality/gene_counts/gene_counts.tsv")
     // Locate the metadata TSV (generate_metadata.py writes metadata.<something>.tsv)
     """
     cp ${projectDir}/subworkflows/translation/local/post_translation_report.qmd .

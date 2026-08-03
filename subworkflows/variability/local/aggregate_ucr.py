@@ -9,7 +9,7 @@ Aggregate UCR windows (from detect_ucr.py) across all genes and produce:
   ucr_clade_variability.tsv  Per-UCR × clade mean variability for core and flanks
                              (requires PROT_RAW FASTA files + taxid_tsv).
   ucr_selection_summary.tsv  Per-UCR selection count summary (written only when
-                             --fubar_sites or --fel_results is provided).
+                             --fubar_sites is provided).
 
 Position cross-referencing for positive selection:
   HyPhy site numbers are 1-based positions in the BMGE-trimmed protein alignment,
@@ -31,7 +31,6 @@ Usage:
     [ --map_dir           MAP ]     \\
     [ --domain_tsv        domain_variability.tsv ]  \\
     [ --fubar_sites       fubar_sites.tsv ]         \\
-    [ --fel_results       fel_results.tsv ]         \\
     [ --alpha 1.0 --beta 1.0 --gamma 1.0 ]
 """
 
@@ -182,28 +181,6 @@ def load_fubar_sites(path):
     return result
 
 
-def load_fel_results(path):
-    """Returns dict  (gene, site_int) -> {dN, dS, p_fel}."""
-    result = {}
-    with open(path) as fh:
-        header = fh.readline().rstrip().split('\t')
-        for line in fh:
-            parts = line.rstrip('\n').split('\t')
-            if len(parts) < len(header):
-                continue
-            d = dict(zip(header, parts))
-            try:
-                key = (d['gene'], int(d['site']))
-                result[key] = {
-                    'dN':    _safe_float(d.get('dN')),
-                    'dS':    _safe_float(d.get('dS')),
-                    'p_fel': _safe_float(d.get('p_fel')),
-                }
-            except (ValueError, KeyError):
-                pass
-    return result
-
-
 def load_domain_tsv(path):
     """Returns dict  gene -> list[{pfam_id, domain_instance, ali_start, ali_end}]."""
     result = {}
@@ -343,19 +320,10 @@ def compute_ucr_clade_variability(gene, ucrs, prot_dir, taxonomy, alpha, beta, g
 # Selection class helper
 # ---------------------------------------------------------------------------
 
-def sel_class(fubar_row, fel_row):
+def sel_class(fubar_row):
     """Return 'positive', 'negative', or 'neutral'."""
     is_pos = fubar_row.get('fubar_is_pos', False)
     is_neg = fubar_row.get('fubar_is_neg', False)
-    if not is_pos and fel_row:
-        p = fel_row.get('p_fel', 1.0)
-        if p < 0.05:
-            is_pos = fel_row.get('dN', 0) > fel_row.get('dS', 0)
-            is_neg = not is_pos
-    if not is_neg and fel_row:
-        p = fel_row.get('p_fel', 1.0)
-        if p < 0.05 and not is_pos:
-            is_neg = True
     if is_pos:
         return 'positive'
     if is_neg:
@@ -386,8 +354,6 @@ def main():
                     help='domain_variability.tsv from map_domain_variability.py')
     ap.add_argument('--fubar_sites',      default=None,
                     help='fubar_sites.tsv from aggregate_positive_selection.py')
-    ap.add_argument('--fel_results',      default=None,
-                    help='fel_results.tsv from aggregate_positive_selection.py')
     ap.add_argument('--alpha',  type=float, default=1.0)
     ap.add_argument('--beta',   type=float, default=1.0)
     ap.add_argument('--gamma',  type=float, default=1.0)
@@ -415,11 +381,9 @@ def main():
 
     has_domain  = args.domain_tsv  and not _is_sentinel(args.domain_tsv)
     has_fubar   = args.fubar_sites and not _is_sentinel(args.fubar_sites)
-    has_fel     = args.fel_results and not _is_sentinel(args.fel_results)
 
     domain_hits = load_domain_tsv(args.domain_tsv)  if has_domain else {}
     fubar_data  = load_fubar_sites(args.fubar_sites) if has_fubar  else {}
-    fel_data    = load_fel_results(args.fel_results) if has_fel    else {}
 
     taxonomy = load_taxonomy(args.taxid_tsv, args.family_order_tsv)
 
@@ -445,9 +409,8 @@ def main():
     pos_opt_dom  = ['pfam_domain']  if has_domain else []
     pos_opt_fub  = ['fubar_prob_pos', 'fubar_prob_neg', 'fubar_is_pos', 'fubar_is_neg'] \
                    if has_fubar else []
-    pos_opt_fel  = ['dN', 'dS', 'p_fel'] if has_fel else []
-    pos_opt_sel  = ['sel_class'] if (has_fubar or has_fel) else []
-    pos_cols = pos_base + pos_opt_dom + pos_opt_fub + pos_opt_fel + pos_opt_sel
+    pos_opt_sel  = ['sel_class'] if has_fubar else []
+    pos_cols = pos_base + pos_opt_dom + pos_opt_fub + pos_opt_sel
 
     pos_path = os.path.join(args.out_dir, 'ucr_positions.tsv')
     n_pos = 0
@@ -464,7 +427,6 @@ def main():
                         continue
                     hphy = gmap.get(pos, pos)  # fallback: raw pos == trim pos
                     fubar_row = fubar_data.get((gene, hphy), {})
-                    fel_row   = fel_data.get((gene, hphy),   {})
 
                     row = {
                         'gene':        gene,
@@ -483,12 +445,8 @@ def main():
                         row['fubar_prob_neg'] = _fmt(fubar_row.get('fubar_prob_neg', float('nan')), 4)
                         row['fubar_is_pos']   = int(fubar_row.get('fubar_is_pos', False))
                         row['fubar_is_neg']   = int(fubar_row.get('fubar_is_neg', False))
-                    if has_fel:
-                        row['dN']    = _fmt(fel_row.get('dN',    float('nan')), 4)
-                        row['dS']    = _fmt(fel_row.get('dS',    float('nan')), 4)
-                        row['p_fel'] = _fmt(fel_row.get('p_fel', float('nan')), 6)
-                    if has_fubar or has_fel:
-                        row['sel_class'] = sel_class(fubar_row, fel_row)
+                    if has_fubar:
+                        row['sel_class'] = sel_class(fubar_row)
 
                     fh.write('\t'.join(str(row[c]) for c in pos_cols) + '\n')
                     n_pos += 1
@@ -516,7 +474,7 @@ def main():
     print(f'Written: {clad_path} ({n_clad} clade×UCR rows)', flush=True)
 
     # ── ucr_selection_summary.tsv (only when psel data is present) ─────────
-    if not (has_fubar or has_fel):
+    if not has_fubar:
         return
 
     sel_cols = [
@@ -525,7 +483,6 @@ def main():
         'n_fubar_pos_core',  'n_fubar_neg_core',
         'n_fubar_pos_flank', 'n_fubar_neg_flank',
         'pct_core_pos_sel',  'pct_core_neg_sel',
-        'n_fel_pos_core',    'n_fel_neg_core',
     ]
     sel_path = os.path.join(args.out_dir, 'ucr_selection_summary.tsv')
     n_sel = 0
@@ -537,7 +494,6 @@ def main():
             for ucr in all_ucrs[gene]:
                 n_core = n_flank = 0
                 n_fub_pc = n_fub_nc = n_fub_pf = n_fub_nf = 0
-                n_fel_pc = n_fel_nc = 0
                 for pos in range(ucr['flank_start'], ucr['flank_end'] + 1):
                     if pos not in ent:
                         continue
@@ -557,15 +513,6 @@ def main():
                             n_fub_pf += int(fr.get('fubar_is_pos', False))
                             n_fub_nf += int(fr.get('fubar_is_neg', False))
 
-                    if has_fel and is_core:
-                        fe = fel_data.get((gene, hphy), {})
-                        p  = fe.get('p_fel', 1.0) if not math.isnan(fe.get('p_fel', float('nan'))) else 1.0
-                        if p < 0.05:
-                            if fe.get('dN', 0) > fe.get('dS', 0):
-                                n_fel_pc += 1
-                            else:
-                                n_fel_nc += 1
-
                 pct_pos = round(100.0 * n_fub_pc / n_core, 2) if n_core else 0.0
                 pct_neg = round(100.0 * n_fub_nc / n_core, 2) if n_core else 0.0
                 row = {
@@ -574,7 +521,6 @@ def main():
                     'n_fubar_pos_core':  n_fub_pc, 'n_fubar_neg_core':  n_fub_nc,
                     'n_fubar_pos_flank': n_fub_pf, 'n_fubar_neg_flank': n_fub_nf,
                     'pct_core_pos_sel':  pct_pos,  'pct_core_neg_sel':  pct_neg,
-                    'n_fel_pos_core':    n_fel_pc, 'n_fel_neg_core':    n_fel_nc,
                 }
                 fh.write('\t'.join(str(row[c]) for c in sel_cols) + '\n')
                 n_sel += 1

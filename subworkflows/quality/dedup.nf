@@ -36,6 +36,9 @@ MANIFEST_EOF
     """
 }
 
+// Note that RENAME_ASSEMBLIES is a separate process because it needs to run after all batches are complete, not after each batch. This is because the renaming script needs to see all deduplicated assemblies at once to ensure unique names across batches.
+// It is highly specific to the TOGA2 pipeline and should not be used in other contexts, or at least it should be used with caution.
+
 process RENAME_ASSEMBLIES {
     label 'process_batch_light'
     publishDir "${params.out_dir}/DEDUP", mode: 'copy', pattern: 'renamed/*.fa', saveAs: { it.replace('renamed/', '').replace('.dedup.fa', '.fa') }

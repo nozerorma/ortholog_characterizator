@@ -11,6 +11,7 @@ format:
     embed-resources: true
     fig-width: 11
     fig-height: 6
+    page-layout: full
 jupyter: python3
 execute:
   dir: file
@@ -152,6 +153,10 @@ display(Markdown(f"""
 | Translation mode | **{TRANSLATION_MODE}** |
 """))
 ```
+
+# Alignment quality
+
+::: {.panel-tabset}
 
 ## Species count distribution
 
@@ -299,6 +304,12 @@ else:
                      "alignment directories.*"))
 ```
 
+:::
+
+# Taxonomy and clade quality
+
+::: {.panel-tabset}
+
 ## Taxonomy breakdown
 
 ```{python}
@@ -372,6 +383,10 @@ else:
 
 ## Clade-level quality
 
+::: {.panel-tabset}
+
+### Stage inputs
+
 ```{python}
 #| label: clade-helpers
 #| echo: false
@@ -428,7 +443,7 @@ def _tax_join(df, taxid):
     return out.merge(tax.drop(columns=sp_col).drop_duplicates('_sp'),
                      on='_sp', how='left').drop(columns='_sp')
 
-def _clade_summary(df, clade_col):
+def _clade_summary(df, clade_col, pool_size=None):
     if clade_col not in df.columns or df.empty:
         return pd.DataFrame()
     sp_genes = (df.groupby(['species', clade_col])['gene']
@@ -440,6 +455,12 @@ def _clade_summary(df, clade_col):
     gene_ct = (sp_genes.groupby(clade_col)['n_genes']
                  .agg(mean_genes='mean', median_genes='median', n_species='count')
                  .round(2).reset_index())
+    if pool_size and pool_size > 0:
+        cov = (sp_genes.assign(coverage_pct=sp_genes['n_genes'] / pool_size * 100)
+                      .groupby(clade_col)['coverage_pct']
+                      .agg(mean_coverage_pct='mean', median_coverage_pct='median')
+                      .round(2).reset_index())
+        gene_ct = gene_ct.merge(cov, on=clade_col, how='left')
     return (ambig.merge(gene_ct, on=clade_col)
                  .sort_values('mean_genes', ascending=False)
                  .reset_index(drop=True))
@@ -447,7 +468,11 @@ def _clade_summary(df, clade_col):
 def _species_summary(df):
     if df.empty:
         return pd.DataFrame()
-    tax_cols = [c for c in df.columns if c not in ('gene', 'ambig_pct', 'stage')]
+    # Group only by taxonomy/identity columns. Numeric per-sequence columns
+    # (aln_len, n_seqs, coverage_pct) must be excluded or each species gets
+    # fragmented into one row per distinct value, collapsing the gene counts.
+    _non_tax = {'gene', 'ambig_pct', 'stage', 'aln_len', 'n_seqs', 'coverage_pct'}
+    tax_cols = [c for c in df.columns if c not in _non_tax]
     return (df.groupby(tax_cols, dropna=False)
               .agg(n_genes=('gene', 'nunique'),
                    mean_ambig=('ambig_pct', 'mean'),
@@ -456,11 +481,19 @@ def _species_summary(df):
               .sort_values('n_genes', ascending=False)
               .reset_index(drop=True))
 
-def _clade_bars(stages, clade_col, metric, title, xlabel, top_n=30):
-    """Side-by-side horizontal bar for one or more (df, label) stage pairs."""
-    dfs  = [_clade_summary(df, clade_col).assign(stage=lbl) for df, lbl in stages]
+def _clade_bars(stages, clade_col, metric, title, xlabel, top_n=30, pool_size=None):
+    """Side-by-side horizontal bar for one or more (df, label) stage pairs.
+
+    When ``pool_size`` is given (or derivable from each stage's gene pool), the
+    coverage_pct columns become available so ``metric`` can be a coverage % such
+    as ``mean_coverage_pct``."""
+    dfs = []
+    for df, lbl in stages:
+        _ps = pool_size or (df['gene'].nunique() if 'gene' in df.columns else None)
+        dfs.append(_clade_summary(df, clade_col, _ps).assign(stage=lbl))
     both = pd.concat(dfs, ignore_index=True)
-    top  = both.groupby(clade_col)['mean_genes'].mean().nlargest(top_n).index
+    sort_metric = metric if metric in both.columns else 'mean_genes'
+    top  = both.groupby(clade_col)[sort_metric].mean().nlargest(top_n).index
     plot = both[both[clade_col].isin(top)].sort_values([clade_col, 'stage'])
     fig  = px.bar(plot, x=metric, y=clade_col, color='stage', barmode='group',
                   orientation='h', title=title,
@@ -508,6 +541,19 @@ _cds_stage_order = [
 cds_stages_data = [(lbl, df) for lbl, df in _cds_stage_order if not df.empty]
 cds_available   = [lbl for lbl, _ in cds_stages_data]
 print(f"CDS stages available: {cds_available or 'none'}")
+
+# ── Visible diagnostic: which CDS dirs were configured, found, and read ────────
+_cds_dir_map = [('DEDUP', DEDUP_DIR, dedup_df),
+                (f'PREFILTER/{FILTER_MODE}', PREFILTER_DIR, prefilter_df),
+                (f'TRIM/{TRANSLATION_MODE}', TRIM_DIR, trim_cds_df)]
+_diag = pd.DataFrame([{
+    'Stage': lbl,
+    'Directory': dpath or '(not set)',
+    'Exists': '✓' if _safe(dpath) else '✗',
+    'Sequences read': f"{len(df):,}",
+} for lbl, dpath, df in _cds_dir_map])
+display(Markdown("**CDS input directories**"))
+ishow(_diag, caption="CDS stage directory diagnostic (Exists ✗ ⇒ stage skipped in the plots below)")
 ```
 
 ```{python}
@@ -517,7 +563,7 @@ print(f"CDS stages available: {cds_available or 'none'}")
 prot_seq_df = pd.DataFrame()
 
 if prot_files:
-    print(f"Reading PROT/{TRANSLATION_MODE}...", end=' ', flush=True)
+    print(f"Reading PROT (from PROT/{TRANSLATION_MODE})...", end=' ', flush=True)
     rows = []
     for fa in prot_files:
         gid = _fa_gene_id(fa)
@@ -557,11 +603,14 @@ else:
                     f'Mean codon ambiguity (%) per {_cl.lower()} — CDS pipeline stages',
                     'Mean codon ambiguity (%)')
 
-        # ── Gene count bars (all stages) ─────────────────────────────────────
+        # ── Gene coverage bars (all stages): genes present per species as a
+        #    fraction of the gene pool (n_genes / pool × 100), 0–100% ─────────
+        _cds_pool = max((df['gene'].nunique() for _, df in cds_stages_data), default=0)
         _clade_bars([(df, lbl) for lbl, df in cds_stages_data], _cc,
-                    'mean_genes',
-                    f'Mean gene count per species per {_cl.lower()} — CDS pipeline stages',
-                    'Mean gene count per species')
+                    'mean_coverage_pct',
+                    f'Mean gene coverage per species per {_cl.lower()} '
+                    f'(% of {_cds_pool}-gene pool) — CDS pipeline stages',
+                    'Mean gene coverage (%)')
 
         # ── Pairwise adjacent-stage ambiguity scatters ───────────────────────
         for (lbl_a, df_a), (lbl_b, df_b) in zip(cds_stages_data, cds_stages_data[1:]):
@@ -581,12 +630,16 @@ else:
                           line=dict(dash='dash', color='grey', width=1))
             show_fig(fig, height=500)
 
-        # ── Summary table for last CDS stage ────────────────────────────────
+        # ── Summary table for last CDS stage (coverage % + raw count) ────────
         _last_lbl, _last_df = cds_stages_data[-1]
-        ishow(_clade_summary(_last_df, _cc).rename(columns={
+        _last_pool = _last_df['gene'].nunique() if 'gene' in _last_df.columns else None
+        ishow(_clade_summary(_last_df, _cc, _last_pool).rename(columns={
                 _cc: _cl, 'mean_ambig': 'Mean ambig (%)', 'median_ambig': 'Median ambig (%)',
-                'mean_genes': 'Mean genes/sp', 'median_genes': 'Median genes/sp', 'n_species': 'N species'}),
-              caption=f"CDS per-{_cl.lower()} summary ({_last_lbl})")
+                'mean_coverage_pct': 'Mean coverage (%)', 'median_coverage_pct': 'Median coverage (%)',
+                'mean_genes': 'Mean genes/sp (count)', 'median_genes': 'Median genes/sp (count)',
+                'n_species': 'N species'}),
+              caption=f"CDS per-{_cl.lower()} summary ({_last_lbl}); "
+                      f"coverage = % of the {_last_pool}-gene pool, genes/sp = raw count")
 
     # ── Per-species wide table ───────────────────────────────────────────────
     display(Markdown("#### Per-species"))
@@ -626,44 +679,66 @@ if prot_seq_df.empty:
 else:
     _ord_col = next((c for c in prot_seq_df.columns if 'order'  in c.lower()), None)
     _fam_col = next((c for c in prot_seq_df.columns if 'family' in c.lower()), None)
-    _prot_lbl = f'PROT/{TRANSLATION_MODE}'
+    prot_pool_size = prot_seq_df['gene'].nunique() if 'gene' in prot_seq_df.columns else 0
+    _prot_lbl = f'PROT ({TRANSLATION_MODE})'
 
     for _cc, _cl in [(_ord_col, 'Order'), (_fam_col, 'Family')]:
         if not _cc:
             continue
         display(Markdown(f"#### By {_cl}"))
-        s = _clade_summary(prot_seq_df, _cc)
+        s = _clade_summary(prot_seq_df, _cc, prot_pool_size)
 
         # ── Scatter: coverage vs ambiguity ───────────────────────────────────
-        fig = px.scatter(s, x='mean_genes', y='mean_ambig',
+        fig = px.scatter(s, x='mean_coverage_pct', y='mean_ambig',
                          size='n_species', hover_name=_cc,
                          color='median_ambig', color_continuous_scale='RdYlGn_r',
-                         title=f'{_cl} quality ({_prot_lbl}): gene coverage vs residue ambiguity',
-                         labels={'mean_genes': 'Mean genes per species',
+                         title=f'{_cl} quality ({_prot_lbl}): protein pool coverage vs residue ambiguity',
+                         labels={'mean_coverage_pct': 'Mean coverage of protein pool (%)',
                                  'mean_ambig': 'Mean ambiguity (%)'})
         fig.update_traces(marker=dict(line=dict(width=1.2, color='rgba(30,30,30,0.5)')))
+        fig.update_layout(coloraxis_colorbar=dict(
+            title=dict(text='Median<br>ambig (%)', side='right'), thickness=14, x=1.02))
         show_fig(fig, height=500)
 
         # ── Bar: gene coverage coloured by ambiguity ─────────────────────────
-        top = s.head(30).sort_values('mean_genes')
-        fig2 = px.bar(top, x='mean_genes', y=_cc, orientation='h',
+        top = s.head(30).sort_values('mean_coverage_pct')
+        fig2 = px.bar(top, x='mean_coverage_pct', y=_cc, orientation='h',
                       color='mean_ambig', color_continuous_scale='RdYlGn_r',
-                      title=f'Mean gene count per {_cl.lower()} ({_prot_lbl}, top 30)',
-                      labels={'mean_genes': 'Mean gene count per species', 'mean_ambig': 'Mean ambig (%)'})
-        fig2.update_layout(height=max(400, len(top) * 22))
+                      title=f'Mean protein-pool coverage per {_cl.lower()} ({_prot_lbl}, top 30)',
+                      labels={'mean_coverage_pct': 'Mean coverage of protein pool (%)',
+                              'mean_ambig': 'Mean ambig (%)'})
+        fig2.update_layout(height=max(400, len(top) * 22),
+                           coloraxis_colorbar=dict(
+                               title=dict(text='Mean<br>ambig (%)', side='right'),
+                               thickness=14, x=1.02))
         show_fig(fig2)
 
         ishow(s.rename(columns={_cc: _cl, 'mean_ambig': 'Mean ambig (%)', 'median_ambig': 'Median ambig (%)',
                                  'mean_genes': 'Mean genes/sp', 'median_genes': 'Median genes/sp',
+                                 'mean_coverage_pct': 'Mean coverage (%)', 'median_coverage_pct': 'Median coverage (%)',
                                  'n_species': 'N species'}),
               caption=f"Protein per-{_cl.lower()} quality ({_prot_lbl})")
 
     # ── Per-species table ────────────────────────────────────────────────────
     display(Markdown("#### Per-species"))
-    ishow(_species_summary(prot_seq_df).rename(columns={
-            'n_genes': 'Gene count', 'mean_ambig': 'Mean ambig (%)', 'median_ambig': 'Median ambig (%)'}),
-          caption=f"Per-species protein quality ({_prot_lbl})")
+    _sp = _species_summary(prot_seq_df)
+    if prot_pool_size:
+        _sp['gene_coverage_pct'] = (_sp['n_genes'] / prot_pool_size * 100).round(2)
+        _sp = _sp.sort_values('gene_coverage_pct', ascending=False).reset_index(drop=True)
+    ishow(_sp.rename(columns={
+            'n_genes': 'Gene count', 'gene_coverage_pct': 'Gene coverage (%)',
+            'mean_ambig': 'Mean ambig (%)', 'median_ambig': 'Median ambig (%)'}),
+          caption=f"Per-species protein quality ({_prot_lbl}); "
+                  f"coverage = % of the {prot_pool_size}-gene protein pool present for each species")
 ```
+
+:::
+
+:::
+
+# Gene and species views
+
+::: {.panel-tabset}
 
 ## Gene coverage table
 
@@ -683,131 +758,241 @@ else:
     display(Markdown("*No quality data available.*"))
 ```
 
-## Species coverage tree
+## Species trees
+
+::: {.panel-tabset}
+
+### Coverage
 
 ```{python}
-#| label: species-tree
+#| label: species-tree-coverage
 #| echo: false
 
 if not (SPECIES_TREE and Path(SPECIES_TREE).exists()):
     display(Markdown("*Species tree not available — pass `--psel_species_tree`.*"))
-elif taxid.empty:
-    display(Markdown("*Species tree requires `TAXID_TSV` to annotate orders.*"))
+elif prot_seq_df.empty:
+    display(Markdown("*Protein coverage data not available — tree coloring skipped.*"))
 else:
     try:
         import toytree, toyplot, toyplot.html
+        import matplotlib.colors as _mc
+        import matplotlib.pyplot as _plt
 
         tree = toytree.tree(SPECIES_TREE)
-        tip_names = tree.get_tip_labels()
-        tip_set   = set(tip_names)
 
-        # ── Build species → order mapping ────────────────────────────────────
-        sp_col  = next((c for c in taxid.columns if c.lower() == 'species'), None)
-        ord_col = next((c for c in taxid.columns if 'order'  in c.lower()), None)
-        fam_col = next((c for c in taxid.columns if 'family' in c.lower()), None)
-
-        if ord_col is None and fam_col and not fam_order_df.empty:
-            fo_fam = next((c for c in fam_order_df.columns if 'family' in c.lower()), None)
-            fo_ord = next((c for c in fam_order_df.columns if 'order'  in c.lower()), None)
-            if fo_fam and fo_ord:
-                taxid2 = taxid.merge(
-                    fam_order_df[[fo_fam, fo_ord]].rename(columns={fo_ord: '_order'}),
-                    left_on=fam_col, right_on=fo_fam, how='left'
-                )
-                ord_col = '_order'
-                taxid = taxid2
-
-        if sp_col is None or ord_col is None:
-            display(Markdown("*Could not resolve species → order mapping from taxid file.*"))
+        # ── Per-species coverage (same metric & RdYlGn_r scale as the mean-cover
+        #    plots above): genes present for each species / protein gene pool.
+        prot_pool_size = prot_seq_df['gene'].nunique() if 'gene' in prot_seq_df.columns else 0
+        if prot_pool_size:
+            sp_coverage = (prot_seq_df.groupby('species')['gene']
+                                  .nunique().reset_index(name='n_genes'))
+            sp_coverage['mean_cover'] = (sp_coverage['n_genes'] / prot_pool_size * 100).round(2)
         else:
-            tax = taxid[[sp_col, ord_col]].copy()
-            tax['_tip'] = tax[sp_col].str.replace(' ', '_', regex=False)
-            sp_to_order = tax.set_index('_tip')[ord_col].to_dict()
+            sp_coverage = pd.DataFrame(columns=['species', 'mean_cover'])
+        sp_coverage['species_key'] = sp_coverage['species'].str.replace(' ', '_', regex=False)
+        cover_map = sp_coverage.set_index('species_key')['mean_cover'].to_dict()
 
-            tip_orders = [sp_to_order.get(t, 'Unknown') for t in tip_names]
-            tip_orders = [o if isinstance(o, str) and o == o else 'Unknown' for o in tip_orders]
+        # ── Species → family map from the taxid file (for pruning + tags) ───────
+        fam_map  = {}
+        keep_set = set(cover_map)        # default: keep tips we have data for
+        if not taxid.empty:
+            _sp_col  = next((c for c in taxid.columns if c.lower() == 'species'), None)
+            _fam_col = next((c for c in taxid.columns if 'family' in c.lower()), None)
+            if _sp_col:
+                _name_col = 'name_class' if 'name_class' in taxid.columns else None
+                _tx = (taxid[taxid[_name_col] == 'scientific name'] if _name_col else taxid).copy()
+                _tx['_key'] = _tx[_sp_col].str.replace(' ', '_', regex=False)
+                keep_set = set(_tx['_key'])
+                if _fam_col:
+                    fam_map = _tx.drop_duplicates('_key').set_index('_key')[_fam_col].to_dict()
 
-            # ── Assign a colour to each order ────────────────────────────────
-            import matplotlib.colors as _mc
-            unique_orders = sorted(set(tip_orders))
-            _palette = (
-                px.colors.qualitative.T10
-                + px.colors.qualitative.Plotly
-                + px.colors.qualitative.Set3
-            )
-            order_color = {o: _palette[i % len(_palette)] for i, o in enumerate(unique_orders)}
-            tip_colors  = [order_color[o] for o in tip_orders]
+        # ── Prune tips absent from the taxid file ──────────────────────────────
+        all_tips   = list(tree.get_tip_labels())
+        drop_tips  = [t for t in all_tips if t not in keep_set]
+        n_pruned   = 0
+        if drop_tips and len(drop_tips) < len(all_tips):
+            # toytree v3 API: tree.mod.drop_tips(*names) -> new tree
+            import contextlib as _contextlib
+            import io as _io
+            with _contextlib.redirect_stdout(_io.StringIO()),_contextlib.redirect_stderr(_io.StringIO()):
+                tree = tree.mod.drop_tips(*drop_tips)
+            n_pruned = len(drop_tips)
 
-            # ── Find MRCA of each order for clade labels ─────────────────────
-            from collections import defaultdict
-            order_tips = defaultdict(list)
-            for tip, order in zip(tip_names, tip_orders):
-                order_tips[order].append(tip)
+        tip_names = tree.get_tip_labels()
+        tip_cover = np.array([cover_map.get(t, np.nan) for t in tip_names], dtype=float)
+        finite = tip_cover[np.isfinite(tip_cover)]
+        if finite.size == 0:
+            display(Markdown("*No tip coverage values matched the tree labels.*"))
+        else:
+            vmin = float(finite.min())
+            vmax = float(finite.max())
+            cmap = _plt.get_cmap("RdYlGn_r")   # identical scale to the mean-cover plots above
+
+            def _cover_color(v):
+                if not np.isfinite(v):
+                    return "#d9d9d9"
+                return _mc.to_hex(cmap((v - vmin) / (vmax - vmin + 1e-9)))
 
             n_nodes = tree.nnodes
-            node_labels = [''] * n_nodes
-            try:
-                for order_name, tips_in_order in order_tips.items():
-                    present = [t for t in tips_in_order if t in tip_set]
-                    if len(present) >= 2:
-                        mrca = tree.get_mrca_node(*present)
-                        node_labels[mrca.idx] = order_name
-                    elif len(present) == 1:
-                        # Single-tip order: label the tip node itself
-                        idx = tip_names.index(present[0])
-                        node_labels[idx] = order_name
-            except Exception:
-                node_labels = [''] * n_nodes  # fallback: no labels
-
-            n_nodes  = tree.nnodes
-            # No tip markers/dots — order is conveyed by branch colour + MRCA labels.
             node_col = ['rgba(0,0,0,0)'] * n_nodes
             node_sz  = [0] * n_nodes
+            edge_colors = ['#b3b3b3'] * n_nodes
 
-            # ── Colour branches by order ─────────────────────────────────────
-            # Colour each edge by dominant descendant order for a cleaner long
-            # dendrogram view.
-            from collections import Counter
-            name_to_order = dict(zip(tip_names, tip_orders))
-            edge_colors = ['#999999'] * n_nodes
+            tip_to_cover = dict(zip(tip_names, tip_cover))
             for node in tree.traverse():
-                ords = [name_to_order.get(l, 'Unknown') for l in node.get_leaf_names()]
-                ords = [o for o in ords if o != 'Unknown']
-                if ords:
-                    dominant = Counter(ords).most_common(1)[0][0]
-                    edge_colors[node.idx] = order_color[dominant]
+                vals = [tip_to_cover.get(l, np.nan) for l in node.get_leaf_names()]
+                vals = [v for v in vals if np.isfinite(v)]
+                if vals:
+                    edge_colors[node.idx] = _cover_color(float(np.mean(vals)))
+
+            # Family tags as right-aligned tip labels (when taxid carries family)
+            tip_labels = [fam_map.get(t, '') for t in tip_names] if fam_map else False
 
             canvas, *_ = tree.draw(
-                layout='r',
-                edge_type='p',
-                tip_labels=False,
+                layout='c',
+                edge_type='c',
+                tip_labels=tip_labels,
                 tip_labels_align=False,
+                tip_labels_style={"font-size": "14px", "fill": "#555"},
                 node_colors=node_col,
                 node_sizes=node_sz,
-                node_labels=node_labels,
-                node_labels_style={"font-size": "8px", "fill": "#333333"},
                 edge_colors=edge_colors,
                 use_edge_lengths=True,
                 padding=10,
                 edge_style={"stroke-width": 2.0},
                 scale_bar=True,
                 width=1300,
-                height=920,
+                height=1300,
             )
-            toyplot.html.render(canvas, "phylo_species_coverage.html")
+            toyplot.html.render(canvas, "phylo_species_cover.html")
             from IPython.display import HTML
-            display(HTML(open("phylo_species_coverage.html").read()))
-
-            # ── Order legend ─────────────────────────────────────────────────
-            legend_rows = "".join(
-                f'<span style="display:inline-block;margin:2px 6px;padding:2px 8px;'
-                f'background:{order_color[o]};border-radius:3px;font-size:12px">{o}</span>'
-                for o in sorted(unique_orders) if o != 'Unknown'
-            )
-            display(HTML(f"<div style='margin-top:8px'><b>Order colours:</b><br>{legend_rows}</div>"))
+            display(HTML(open("phylo_species_cover.html").read()))
+            display(Markdown(
+                f"*Branch colour = mean residue coverage (%) of descendant tips "
+                f"({vmin:.2f}% to {vmax:.2f}%, scale = RdYlGn_r — identical to the mean-coverage "
+                f"plots above). Tip labels show family. "
+                f"{n_pruned} tip(s) absent from the taxid file were pruned before plotting.*"
+            ))
 
     except ImportError:
         display(Markdown("*toytree not installed — species tree skipped.*"))
     except Exception as e:
         display(Markdown(f"*Could not render species tree: {e}*"))
 ```
+
+### Ambiguity
+
+```{python}
+#| label: species-tree-ambiguity
+#| echo: false
+
+if not (SPECIES_TREE and Path(SPECIES_TREE).exists()):
+    display(Markdown("*Species tree not available — pass `--psel_species_tree`.*"))
+elif prot_seq_df.empty:
+    display(Markdown("*Protein coverage data not available — tree coloring skipped.*"))
+else:
+    try:
+        import toytree, toyplot, toyplot.html
+        import matplotlib.colors as _mc
+        import matplotlib.pyplot as _plt
+
+        tree = toytree.tree(SPECIES_TREE)
+
+        # ── Per-species mean residue ambiguity (same metric & RdYlGn_r scale as
+        #    the "mean ambig" plots above) ─────────────────────────────────────
+        sp_ambig = (prot_seq_df.groupby('species')['ambig_pct']
+                              .mean().rename('mean_ambig').reset_index())
+        sp_ambig['species_key'] = sp_ambig['species'].str.replace(' ', '_', regex=False)
+        ambig_map = sp_ambig.set_index('species_key')['mean_ambig'].to_dict()
+
+        # ── Species → family map from the taxid file (for pruning + tags) ───────
+        fam_map  = {}
+        keep_set = set(ambig_map)        # default: keep tips we have data for
+        if not taxid.empty:
+            _sp_col  = next((c for c in taxid.columns if c.lower() == 'species'), None)
+            _fam_col = next((c for c in taxid.columns if 'family' in c.lower()), None)
+            if _sp_col:
+                _name_col = 'name_class' if 'name_class' in taxid.columns else None
+                _tx = (taxid[taxid[_name_col] == 'scientific name'] if _name_col else taxid).copy()
+                _tx['_key'] = _tx[_sp_col].str.replace(' ', '_', regex=False)
+                keep_set = set(_tx['_key'])
+                if _fam_col:
+                    fam_map = _tx.drop_duplicates('_key').set_index('_key')[_fam_col].to_dict()
+
+        # ── Prune tips absent from the taxid file ──────────────────────────────
+        all_tips   = list(tree.get_tip_labels())
+        drop_tips  = [t for t in all_tips if t not in keep_set]
+        n_pruned   = 0
+        if drop_tips and len(drop_tips) < len(all_tips):
+            # toytree v3 API: tree.mod.drop_tips(*names) -> new tree
+            import contextlib as _contextlib
+            import io as _io
+            with _contextlib.redirect_stdout(_io.StringIO()),_contextlib.redirect_stderr(_io.StringIO()):
+                tree = tree.mod.drop_tips(*drop_tips)
+            n_pruned = len(drop_tips)
+
+        tip_names = tree.get_tip_labels()
+        tip_ambig = np.array([ambig_map.get(t, np.nan) for t in tip_names], dtype=float)
+        finite = tip_ambig[np.isfinite(tip_ambig)]
+        if finite.size == 0:
+            display(Markdown("*No tip ambiguity values matched the tree labels.*"))
+        else:
+            vmin = float(finite.min())
+            vmax = float(finite.max())
+            cmap = _plt.get_cmap("RdYlGn_r")   # identical scale to the mean-ambig plots above
+
+            def _ambig_color(v):
+                if not np.isfinite(v):
+                    return "#d9d9d9"
+                return _mc.to_hex(cmap((v - vmin) / (vmax - vmin + 1e-9)))
+
+            n_nodes = tree.nnodes
+            node_col = ['rgba(0,0,0,0)'] * n_nodes
+            node_sz  = [0] * n_nodes
+            edge_colors = ['#b3b3b3'] * n_nodes
+
+            tip_to_ambig = dict(zip(tip_names, tip_ambig))
+            for node in tree.traverse():
+                vals = [tip_to_ambig.get(l, np.nan) for l in node.get_leaf_names()]
+                vals = [v for v in vals if np.isfinite(v)]
+                if vals:
+                    edge_colors[node.idx] = _ambig_color(float(np.mean(vals)))
+
+            # Family tags as right-aligned tip labels (when taxid carries family)
+            tip_labels = [fam_map.get(t, '') for t in tip_names] if fam_map else False
+
+            canvas, *_ = tree.draw(
+                layout='c',
+                edge_type='c',
+                tip_labels=tip_labels,
+                tip_labels_align=False,
+                tip_labels_style={"font-size": "14px", "fill": "#555"},
+                node_colors=node_col,
+                node_sizes=node_sz,
+                edge_colors=edge_colors,
+                use_edge_lengths=True,
+                padding=10,
+                edge_style={"stroke-width": 2.0},
+                scale_bar=True,
+                width=1300,
+                height=1300,
+            )
+            toyplot.html.render(canvas, "phylo_species_ambig.html")
+            from IPython.display import HTML
+            display(HTML(open("phylo_species_ambig.html").read()))
+            display(Markdown(
+                f"*Branch colour = mean residue ambiguity (%) of descendant tips "
+                f"({vmin:.2f}% to {vmax:.2f}%, scale = RdYlGn_r — identical to the mean-ambiguity "
+                f"plots above). Tip labels show family. "
+                f"{n_pruned} tip(s) absent from the taxid file were pruned before plotting.*"
+            ))
+
+    except ImportError:
+        display(Markdown("*toytree not installed — species tree skipped.*"))
+    except Exception as e:
+        display(Markdown(f"*Could not render species tree: {e}*"))
+```
+
+:::
+
+:::

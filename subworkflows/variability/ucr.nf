@@ -44,7 +44,6 @@ process AGGREGATE_UCR {
     path taxid_tsv
     path domain_tsv     // domain_variability.tsv or NO_DOMAIN_TSV sentinel
     path fubar_sites    // fubar_sites.tsv or NO_FUBAR sentinel
-    path fel_results    // fel_results.tsv or NO_FEL sentinel
 
     output:
     path "ucr_windows.tsv",             emit: ucr_windows
@@ -59,7 +58,6 @@ process AGGREGATE_UCR {
     def alpha_arg = "--alpha ${params.valdar_alpha} --beta ${params.valdar_beta} --gamma ${params.valdar_gamma}"
     def dom_arg   = (domain_tsv.name  != 'NO_DOMAIN_TSV') ? "--domain_tsv '${domain_tsv}'"   : ''
     def fubar_arg = (fubar_sites.name != 'NO_FUBAR')       ? "--fubar_sites '${fubar_sites}'" : ''
-    def fel_arg   = (fel_results.name != 'NO_FEL')         ? "--fel_results '${fel_results}'" : ''
     """
     mkdir -p UCR_RAW PROT_VAR_RAW PROT_RAW MAP
 
@@ -80,8 +78,7 @@ process AGGREGATE_UCR {
         ${alpha_arg}  \\
         ${fam_arg}    \\
         ${dom_arg}    \\
-        ${fubar_arg}  \\
-        ${fel_arg}
+        ${fubar_arg}
     """
 }
 
@@ -95,7 +92,6 @@ workflow UCR_ANALYSIS {
     map_ch        // tuple(gene_id, map_tsv)       — BMGE position maps (may be empty)
     domain_tsv    // single file or sentinel file('NO_DOMAIN_TSV')
     fubar_sites   // single file or sentinel file('NO_FUBAR')
-    fel_results   // single file or sentinel file('NO_FEL')
 
     main:
 
@@ -113,8 +109,7 @@ workflow UCR_ANALYSIS {
         map_ch.collect     { it[1] }.ifEmpty( [file('NO_MAPS')] ),
         file(params.taxid_tsv),
         domain_tsv,
-        fubar_sites,
-        fel_results
+        fubar_sites
     )
 
     emit:

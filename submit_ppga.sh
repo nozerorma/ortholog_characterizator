@@ -35,7 +35,10 @@ TAXID_TSV="${ROOT}/taxa_info/taxid_species_family_primates.tsv"
 FAMILY_ORDER_TSV="${ROOT}/taxa_info/family_to_order.tsv"
 
 # ── Output ────────────────────────────────────────────────────────────────────
-OUT_DIR="${ROOT}/results_ppga/$(date +%Y%m%d_%H%M%S)"
+# Leave FIXED_OUT_DIR empty for a fresh timestamped dir, or set it to resume
+# into an existing results directory (e.g. after a kill-and-restart).
+FIXED_OUT_DIR=""
+OUT_DIR="${FIXED_OUT_DIR:-${ROOT}/results_ppga/$(date +%Y%m%d_%H%M%S)}"
 WORK_DIR="/data/samanthafs/scratch/lab_anavarro/mramon/3.Work_dirs/generate_alis_nf/work_ppga"
 
 # ── Pre-computed inputs (optional) ────────────────────────────────────────────
@@ -90,7 +93,7 @@ BMGE_GAP_THRESH="0.1"         # -g: max gap rate allowed per column; 0.0 = remov
 BMGE_ENTROPY_THRESH="0.5"     # -h: max entropy score; 1.0 = no trimming
 
 # ── Test mode: run on a random subset of TEST_N_GENES genes ──────────────────
-TEST_MODE=true
+TEST_MODE=false
 TEST_N_GENES=100
 
 # ── Concurrency: per-gene batch sizing (scales with dataset size) ────────────
@@ -101,12 +104,12 @@ TEST_N_GENES=100
 # WORKERS is capped per stage by its CPU allocation in conf/resources.config
 # (batch_light=8, batch_heavy=16 cpus).
 #
-# HyPhy is sized SEPARATELY: FUBAR+BUSTED (first pass) and MEME (second pass) are
-# far heavier per gene than the alignment/variability stages, and MEME is the
-# pipeline bottleneck — so it gets its own batch/worker knobs.
+# HyPhy is sized SEPARATELY: FUBAR (first pass), BUSTED (second pass, gene-level),
+# and MEME (third pass, episodic site-level) are far heavier per gene than the
+# alignment/variability stages — each runs in its own independent batch process.
 if [[ "$TEST_MODE" == "true" ]]; then
     BATCH_SIZE=16;       BATCH_WORKERS=4        # dedup / filter / BMGE / variability
-    PSEL_BATCH_SIZE=8;   PSEL_BATCH_WORKERS=4   # HyPhy (FUBAR/BUSTED/MEME)
+    PSEL_BATCH_SIZE=8;   PSEL_BATCH_WORKERS=4   # HyPhy (FUBAR / BUSTED / MEME)
 else
     BATCH_SIZE=96;       BATCH_WORKERS=6
     PSEL_BATCH_SIZE=48;  PSEL_BATCH_WORKERS=8
@@ -117,8 +120,9 @@ GENE_LIST=""    # path to plain-text file (one gene name per line); leave empty 
 
 # ── Positive selection ────────────────────────────────────────────────────────
 PSEL_SPECIES_TREE="${ROOT}/external_phylogenies/primates_233_subst.tree"          # subst/site branch lengths (NOT the fossil-cal timetree: its MY branch lengths overflow HyPhy MEME's rate*length domain) — required when RUN_POSITIVE_SELECTION=true
-HYPHY_METHODS="FUBAR,BUSTED"  # first-pass methods. BUSTED is the gene-level gate that decides
-                              # which genes get site-level MEME (2nd pass). FEL/SLAC also available.
+RUN_FUBAR=true                # site-level FUBAR positive selection test
+RUN_BUSTED=true               # gene-level episodic selection test; gates which genes get MEME
+RUN_MEME=true                 # site-level episodic selection (2nd pass, on BUSTED-significant genes)
 FUBAR_THRESHOLD="0.9"         # posterior probability threshold for positive sites
 
 # ── Variability / Pfam ────────────────────────────────────────────────────────
@@ -142,7 +146,6 @@ UCR_FLANK_SIZE=""             # flanking aa on each side of every window   (defa
 # Optional: site-level positive-selection data from a prior pipeline run.
 # Provide these when RUN_POSITIVE_SELECTION=false but psel was run previously.
 FUBAR_SITES_TSV=""            # fubar_sites.tsv from a prior positive-selection run
-FEL_RESULTS_TSV=""            # fel_results.tsv  from a prior positive-selection run
 
 # ── Phylogeny ─────────────────────────────────────────────────────────────────
 GENE_TREE_METHOD="iqtree"     # iqtree | codeml
@@ -168,7 +171,9 @@ NF_OPTIONAL+=" --variability_batch_size $BATCH_SIZE --variability_batch_workers 
 NF_OPTIONAL+=" --psel_batch_size $PSEL_BATCH_SIZE --psel_batch_workers $PSEL_BATCH_WORKERS"
 [[ -n "$PSEL_SPECIES_TREE"      ]] && NF_OPTIONAL+=" --psel_species_tree $PSEL_SPECIES_TREE"
 [[ -n "$IQTREE_MSET"            ]] && NF_OPTIONAL+=" --iqtree_mset $IQTREE_MSET"
-[[ -n "$HYPHY_METHODS"          ]] && NF_OPTIONAL+=" --hyphy_methods $HYPHY_METHODS"
+NF_OPTIONAL+=" --run_fubar $RUN_FUBAR"
+NF_OPTIONAL+=" --run_busted $RUN_BUSTED"
+NF_OPTIONAL+=" --run_meme $RUN_MEME"
 [[ -n "$FUBAR_THRESHOLD"        ]] && NF_OPTIONAL+=" --fubar_threshold $FUBAR_THRESHOLD"
 [[ -n "$GENE_TREE_METHOD"       ]] && NF_OPTIONAL+=" --gene_tree_method $GENE_TREE_METHOD"
 [[ -n "$SPECIES_TREE_METHOD"    ]] && NF_OPTIONAL+=" --species_tree_method $SPECIES_TREE_METHOD"
@@ -188,7 +193,6 @@ NF_OPTIONAL+=" --psel_batch_size $PSEL_BATCH_SIZE --psel_batch_workers $PSEL_BAT
 [[ -n "$UCR_WINDOW_THRESHOLD"   ]] && NF_OPTIONAL+=" --ucr_window_threshold $UCR_WINDOW_THRESHOLD"
 [[ -n "$UCR_FLANK_SIZE"         ]] && NF_OPTIONAL+=" --ucr_flank_size $UCR_FLANK_SIZE"
 [[ -n "$FUBAR_SITES_TSV"        ]] && NF_OPTIONAL+=" --fubar_sites_tsv $FUBAR_SITES_TSV"
-[[ -n "$FEL_RESULTS_TSV"        ]] && NF_OPTIONAL+=" --fel_results_tsv $FEL_RESULTS_TSV"
 # Pre-computed input dirs
 [[ -n "$PROT_DIR"               ]] && NF_OPTIONAL+=" --prot_dir $PROT_DIR"
 [[ -n "$TRIM_DIR"               ]] && NF_OPTIONAL+=" --trim_dir $TRIM_DIR"
@@ -243,7 +247,8 @@ nextflow run "${NF_DIR}/main.nf" \\
     --bmge_entropy_threshold "${BMGE_ENTROPY_THRESH}" \\
     ${NF_OPTIONAL} \\
     -profile slurm \\
-    -work-dir "${WORK_DIR}"
+    -work-dir "${WORK_DIR}" \\
+    -resume
 
 echo "[\$(date)] Pipeline complete"
 EOF

@@ -20,7 +20,11 @@ process RENDER_PSEL_REPORT {
     def taxid     = params.taxid_tsv         ? params.taxid_tsv         : ''
     def fam_order = params.family_order_tsv  ? params.family_order_tsv  : ''
     def sp_tree   = params.psel_species_tree ? params.psel_species_tree : ''
-    def methods   = params.hyphy_methods
+    def methods_list = []
+    if (params.run_fubar)  methods_list << 'FUBAR'
+    if (params.run_busted) methods_list << 'BUSTED'
+    if (params.run_meme)   methods_list << 'MEME'
+    def methods = methods_list.join(',')
     def threshold = params.fubar_threshold
     """
     cp ${projectDir}/subworkflows/positive_selection/local/positive_selection_report.qmd .

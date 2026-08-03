@@ -168,14 +168,15 @@ Requires `--run_variability true`. Detects ultra-conserved regions using two com
 | `--ucr_window_threshold` | `0.85` | Mean C\_trident floor within a sliding window |
 | `--ucr_flank_size` | `5` | Flanking amino acids reported on each side of a UCR |
 | `--fubar_sites_tsv` | — | `fubar_sites.tsv` from a prior positive-selection run (enriches UCR output without re-running psel) |
-| `--fel_results_tsv` | — | `fel_results.tsv` from a prior positive-selection run |
 
 ### Positive selection
 
 | Parameter | Default | Description |
 |---|---|---|
 | `--psel_species_tree` | — | Species tree in Newick format — **required** |
-| `--hyphy_methods` | `FUBAR,FEL` | Comma-separated list: `FUBAR`, `FEL`, `MEME`, `SLAC` |
+| `--run_fubar` | `true` | Run FUBAR (site-level positive selection test) |
+| `--run_busted` | `true` | Run BUSTED (gene-level positive selection test; gates MEME) |
+| `--run_meme` | `true` | Run MEME (site-level episodic positive selection test on candidates) |
 | `--fubar_threshold` | `0.9` | Posterior probability threshold for positive sites |
 | `--sel_variability_tsv` | — | `sel_variability.tsv` from a prior psel run (enriches the variability report without re-running psel) |
 | `--variability_tsv` | — | `gene_variability.tsv` from a prior variability run (enriches the psel report without re-running variability) |

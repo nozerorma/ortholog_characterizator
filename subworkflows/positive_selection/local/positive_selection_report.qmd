@@ -11,6 +11,7 @@ format:
     embed-resources: true
     fig-width: 11
     fig-height: 6
+    page-layout: full
 jupyter: python3
 execute:
   dir: file
@@ -156,80 +157,124 @@ display(Markdown(f"""
 """))
 ```
 
-## FUBAR results
+# Selection results
+
+::: {.panel-tabset}
+
+## FUBAR, pervasive
+
+::: {.panel-tabset}
+
+### Positive
 
 ```{python}
-#| label: fubar-hist
+#| label: fubar-positive
 #| echo: false
 
-if not fubar_df.empty:
+if not fubar_df.empty and pos_col_fubar:
     gene_col = next((c for c in fubar_df.columns if 'gene' in c.lower()), fubar_df.columns[0])
+    pos_genes = fubar_df[fubar_df[pos_col_fubar] > 0]
 
-    # ── Positive selection ────────────────────────────────────────────────────
-    if pos_col_fubar:
-        pos_genes = fubar_df[fubar_df[pos_col_fubar] > 0]
+    fig = px.histogram(
+        fubar_df, x=pos_col_fubar, nbins=40,
+        title=f'FUBAR: positive selection — sites per gene (PP ≥ {FUBAR_THRESHOLD})',
+        labels={pos_col_fubar: 'Sites with PP(α<β) ≥ threshold'},
+        color_discrete_sequence=[T10[3]],
+    )
+    fig.update_layout(bargap=0.05)
+    show_fig(fig)
 
-        fig = px.histogram(fubar_df, x=pos_col_fubar, nbins=40,
-                           title=f'FUBAR: positive selection — sites per gene (PP ≥ {FUBAR_THRESHOLD})',
-                           labels={pos_col_fubar: 'Sites with PP(α<β) ≥ threshold'},
-                           color_discrete_sequence=[T10[3]])
-        fig.update_layout(bargap=0.05)
-        show_fig(fig)
+    top_fubar = pos_genes.sort_values(pos_col_fubar, ascending=False).head(40)
+    if not top_fubar.empty:
+        fig2 = px.bar(
+            top_fubar, x=pos_col_fubar, y=gene_col,
+            orientation='h',
+            title=f'Top genes by FUBAR-positive sites (PP ≥ {FUBAR_THRESHOLD})',
+            labels={pos_col_fubar: 'Positive sites', gene_col: 'Gene'},
+            color=pos_col_fubar, color_continuous_scale='YlOrRd',
+        )
+        fig2.update_layout(yaxis={'categoryorder': 'total ascending'}, height=max(400, len(top_fubar) * 22))
+        show_fig(fig2)
 
-        top_fubar = pos_genes.sort_values(pos_col_fubar, ascending=False).head(40)
-        if not top_fubar.empty:
-            fig2 = px.bar(top_fubar, x=pos_col_fubar, y=gene_col,
-                          orientation='h',
-                          title=f'Top genes by FUBAR-positive sites (PP ≥ {FUBAR_THRESHOLD})',
-                          labels={pos_col_fubar: 'Positive sites', gene_col: 'Gene'},
-                          color=pos_col_fubar, color_continuous_scale='YlOrRd')
-            fig2.update_layout(yaxis={'categoryorder': 'total ascending'}, height=max(400, len(top_fubar) * 22))
-            show_fig(fig2)
-
-        ishow(pos_genes.sort_values(pos_col_fubar, ascending=False).reset_index(drop=True),
-              caption="All genes with FUBAR positive selection sites")
-
-    # ── Purifying selection ───────────────────────────────────────────────────
-    if neg_col_fubar:
-        neg_genes = fubar_df[fubar_df[neg_col_fubar] > 0]
-
-        fig3 = px.histogram(fubar_df, x=neg_col_fubar, nbins=40,
-                            title=f'FUBAR: purifying selection — sites per gene (PP ≥ {FUBAR_THRESHOLD})',
-                            labels={neg_col_fubar: 'Sites with PP(α>β) ≥ threshold'},
-                            color_discrete_sequence=[T10[0]])
-        fig3.update_layout(bargap=0.05)
-        show_fig(fig3)
-
-        top_neg = neg_genes.sort_values(neg_col_fubar, ascending=False).head(40)
-        if not top_neg.empty:
-            fig4 = px.bar(top_neg, x=neg_col_fubar, y=gene_col,
-                          orientation='h',
-                          title=f'Top genes by FUBAR-purifying sites (PP ≥ {FUBAR_THRESHOLD})',
-                          labels={neg_col_fubar: 'Purifying sites', gene_col: 'Gene'},
-                          color=neg_col_fubar, color_continuous_scale='Blues')
-            fig4.update_layout(yaxis={'categoryorder': 'total ascending'}, height=max(400, len(top_neg) * 22))
-            show_fig(fig4)
-
-    # ── Scatter: positive vs purifying per gene ───────────────────────────────
-    if pos_col_fubar and neg_col_fubar:
-        fubar_df['selection_class'] = 'neutral'
-        fubar_df.loc[fubar_df[pos_col_fubar] > 0, 'selection_class'] = 'positive'
-        fubar_df.loc[fubar_df[neg_col_fubar] > 0, 'selection_class'] = 'purifying'
-        fubar_df.loc[(fubar_df[pos_col_fubar] > 0) & (fubar_df[neg_col_fubar] > 0), 'selection_class'] = 'both'
-        fig5 = px.scatter(fubar_df, x=neg_col_fubar, y=pos_col_fubar,
-                          color='selection_class',
-                          hover_name=gene_col,
-                          color_discrete_map={'positive': T10[3], 'purifying': T10[0],
-                                              'both': T10[2], 'neutral': 'lightgrey'},
-                          title='FUBAR: positive vs purifying selection sites per gene',
-                          labels={neg_col_fubar: 'Purifying sites (PP(α>β) ≥ threshold)',
-                                  pos_col_fubar: 'Positive sites (PP(α<β) ≥ threshold)'},
-                          opacity=0.7)
-        fig5.update_traces(marker_size=7)
-        show_fig(fig5)
+    ishow(pos_genes.sort_values(pos_col_fubar, ascending=False).reset_index(drop=True),
+          caption="All genes with FUBAR positive selection sites")
+elif fubar_df.empty:
+    display(Markdown("*FUBAR results unavailable.*"))
+else:
+    display(Markdown("*FUBAR positive-site column not found.*"))
 ```
 
-## FUBAR site-level results
+### Purifying
+
+```{python}
+#| label: fubar-purifying
+#| echo: false
+
+if not fubar_df.empty and neg_col_fubar:
+    gene_col = next((c for c in fubar_df.columns if 'gene' in c.lower()), fubar_df.columns[0])
+    neg_genes = fubar_df[fubar_df[neg_col_fubar] > 0]
+
+    fig = px.histogram(
+        fubar_df, x=neg_col_fubar, nbins=40,
+        title=f'FUBAR: purifying selection — sites per gene (PP ≥ {FUBAR_THRESHOLD})',
+        labels={neg_col_fubar: 'Sites with PP(α>β) ≥ threshold'},
+        color_discrete_sequence=[T10[0]],
+    )
+    fig.update_layout(bargap=0.05)
+    show_fig(fig)
+
+    top_neg = neg_genes.sort_values(neg_col_fubar, ascending=False).head(40)
+    if not top_neg.empty:
+        fig2 = px.bar(
+            top_neg, x=neg_col_fubar, y=gene_col,
+            orientation='h',
+            title=f'Top genes by FUBAR-purifying sites (PP ≥ {FUBAR_THRESHOLD})',
+            labels={neg_col_fubar: 'Purifying sites', gene_col: 'Gene'},
+            color=neg_col_fubar, color_continuous_scale='Blues',
+        )
+        fig2.update_layout(yaxis={'categoryorder': 'total ascending'}, height=max(400, len(top_neg) * 22))
+        show_fig(fig2)
+
+    ishow(neg_genes.sort_values(neg_col_fubar, ascending=False).reset_index(drop=True),
+          caption="All genes with FUBAR purifying selection sites")
+elif fubar_df.empty:
+    display(Markdown("*FUBAR results unavailable.*"))
+else:
+    display(Markdown("*FUBAR purifying-site column not found.*"))
+```
+
+### Positive vs purifying
+
+```{python}
+#| label: fubar-pos-vs-purifying
+#| echo: false
+
+if not fubar_df.empty and pos_col_fubar and neg_col_fubar:
+    gene_col = next((c for c in fubar_df.columns if 'gene' in c.lower()), fubar_df.columns[0])
+    fubar_plot = fubar_df.copy()
+    fubar_plot['selection_class'] = 'neutral'
+    fubar_plot.loc[fubar_plot[pos_col_fubar] > 0, 'selection_class'] = 'positive'
+    fubar_plot.loc[fubar_plot[neg_col_fubar] > 0, 'selection_class'] = 'purifying'
+    fubar_plot.loc[(fubar_plot[pos_col_fubar] > 0) & (fubar_plot[neg_col_fubar] > 0), 'selection_class'] = 'both'
+
+    fig = px.scatter(
+        fubar_plot, x=neg_col_fubar, y=pos_col_fubar,
+        color='selection_class',
+        hover_name=gene_col,
+        color_discrete_map={'positive': T10[3], 'purifying': T10[0],
+                            'both': T10[2], 'neutral': 'lightgrey'},
+        title='FUBAR: positive vs purifying selection sites per gene',
+        labels={neg_col_fubar: 'Purifying sites (PP(α>β) ≥ threshold)',
+                pos_col_fubar: 'Positive sites (PP(α<β) ≥ threshold)'},
+        opacity=0.7,
+    )
+    fig.update_traces(marker_size=7)
+    show_fig(fig)
+else:
+    display(Markdown("*Both FUBAR positive and purifying columns are required for this view.*"))
+```
+
+### Site-level positive calls
 
 ```{python}
 #| label: fubar-sites
@@ -246,10 +291,12 @@ if has_fubar_sites:
         display(Markdown(f"**{len(hits):,} positively selected sites** across **{hits[g_col].nunique()} genes**"))
 
         if prob_col:
-            fig = px.histogram(hits, x=prob_col, nbins=50,
-                               title='FUBAR positive sites: posterior probability distribution',
-                               labels={prob_col: 'Posterior probability (positive selection)'},
-                               color_discrete_sequence=[T10[3]])
+            fig = px.histogram(
+                hits, x=prob_col, nbins=50,
+                title='FUBAR positive sites: posterior probability distribution',
+                labels={prob_col: 'Posterior probability (positive selection)'},
+                color_discrete_sequence=[T10[3]],
+            )
             show_fig(fig)
 
         ishow(hits.sort_values(prob_col, ascending=False).head(500).reset_index(drop=True) if prob_col else hits.head(500),
@@ -259,6 +306,8 @@ if has_fubar_sites:
 else:
     display(Markdown("*FUBAR site-level data (fubar_sites.tsv) not available.*"))
 ```
+
+:::
 
 ## BUSTED gene-level gate
 
@@ -298,7 +347,7 @@ if has_busted:
           else busted_df.reset_index(drop=True),
           caption="BUSTED gene-level results (sorted by q-value)")
 else:
-    display(Markdown("*BUSTED was not run (not in `hyphy_methods`). The MEME gate fell back to FUBAR-FDR sites.*"))
+    display(Markdown("*BUSTED was not run. The MEME gate fell back to FUBAR-FDR sites.*"))
 ```
 
 ## MEME results
@@ -428,7 +477,9 @@ else:
     display(Markdown("*FUBAR results unavailable — consensus table skipped.*"))
 ```
 
-## Variability vs positive selection
+:::
+
+# Variability vs positive selection
 
 ```{python}
 #| label: var-vs-sel
@@ -461,4 +512,3 @@ else:
     display(Markdown("*Variability × selection join not available — gene_variability.tsv was not passed.*  \n"
                      "Run the variability workflow first, or pass `--variability_tsv`.*"))
 ```
-
