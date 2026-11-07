@@ -92,7 +92,7 @@ PYEOF
     if [[ $exit_code -eq 124 ]]; then
         # MST bug workaround: append duplicate of first sequence with sentinel tag
         echo "[BMGE] WARN: timeout for $gene_id, applying MST workaround" >&2
-        first_seq=$(awk '/^>/{if(p)exit; p=1} p' "$tmp_fa")
+        first_seq=$(awk '/^>/{if(p)exit; p=1; next} p' "$tmp_fa")   # sequence only, without its header line
         first_hdr=$(grep '^>' "$tmp_fa" | head -1 | sed 's/^>//')
         printf ">%s_BMGE_SENTINEL_DUPE\n%s\n" "$first_hdr" "$first_seq" >> "$tmp_fa"
 
