@@ -72,17 +72,57 @@ with open(path, 'w') as fh:
 PYEOF
     }
 
+    # Convert a single-block, non-interleaved NEXUS alignment (BMGE's -odna
+    # output) to FASTA. BMGE's own -t CODON + -of gives the trimmed alignment
+    # back at codon-UNIT length (one character per retained codon, not per
+    # nucleotide) rather than full nucleotide triplets -- -odna is the only
+    # combination that returns the real, full-length trimmed nucleotide
+    # sequence, but only in NEXUS.
+    nexus_to_fasta() {
+        local nex="$1" fa="$2"
+        "$PYTHON" - "$nex" "$fa" <<'PYEOF'
+import sys
+nex_path, fa_path = sys.argv[1], sys.argv[2]
+lines = open(nex_path).readlines()
+out = []
+in_matrix = False
+for line in lines:
+    stripped = line.strip()
+    if stripped.lower().startswith("matrix"):
+        in_matrix = True
+        continue
+    if not in_matrix:
+        continue
+    if stripped in (";", "") or stripped.lower() == "end;":
+        continue
+    parts = stripped.split(None, 1)
+    if len(parts) != 2:
+        continue
+    name, seq = parts
+    out.append(f">{name}\n{seq.replace(' ', '')}\n")
+with open(fa_path, "w") as fh:
+    fh.writelines(out)
+PYEOF
+    }
+
     # Run BMGE (with timeout guard)
     run_once() {
         local in_fa="$1"
+        local trim_nex="${trim_out}.nex"
         timeout "$BMGE_TIMEOUT" bmge \
             -i  "$in_fa" \
             -t  CODON \
             -g  "$gap_thresh" \
             -h  "$entropy_thresh" \
-            -of "$trim_out" \
+            -odna "$trim_nex" \
             -oh "$track_out" \
             -oaaf "$prot_out"
+        local rc=$?
+        if [[ -s "$trim_nex" ]]; then
+            nexus_to_fasta "$trim_nex" "$trim_out"
+            rm -f "$trim_nex"
+        fi
+        return $rc
     }
 
     cp "$fasta" "$tmp_fa"

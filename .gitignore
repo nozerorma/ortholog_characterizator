@@ -1,5 +1,11 @@
+docs
+out
+results
+.nextflow*
 variability_report_files
 .history
 positive_selection_report_files
 post_translation_report
 __pycache__
+token.tk
+tests

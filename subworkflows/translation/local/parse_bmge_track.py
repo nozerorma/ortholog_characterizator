@@ -163,7 +163,7 @@ def codon_cols_to_aa_pos(ref_aligned_seq):
 # GFF-based genomic coordinate mapping
 # ---------------------------------------------------------------------------
 
-def load_cds_positions(gff_path, protein_id):
+def load_cds_positions(gff_path, protein_id, with_strand=False):
     """
     Parse GFF3/GFF2 for CDS features whose attribute field contains protein_id.
     Build the strand-aware ordered list of genomic nt positions for the CDS.
@@ -189,7 +189,7 @@ def load_cds_positions(gff_path, protein_id):
             strand = fields[6]
 
     if not starts:
-        return [], chrom or ''
+        return ([], chrom or '', strand) if with_strand else ([], chrom or '')
 
     cds_positions = []
     if strand == '+':
@@ -203,7 +203,7 @@ def load_cds_positions(gff_path, protein_id):
             for j in range(curr_end, curr_start - 1, -1):
                 cds_positions.append(j)
 
-    return cds_positions, chrom
+    return (cds_positions, chrom, strand) if with_strand else (cds_positions, chrom)
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +230,7 @@ def main():
                         help='Reference species header pattern (default: Homo_sapiens)')
     args = parser.parse_args()
 
-    gene = os.path.basename(args.out_tsv).replace('.tsv', '')
+    gene = os.path.basename(args.out_tsv).removesuffix('.map.tsv').removesuffix('.tsv')
 
     # 1. Parse TRACK HTML
     selected, removed = parse_track_html(args.track_html)
@@ -261,20 +261,14 @@ def main():
         col_to_aa = codon_cols_to_aa_pos(ref_seq)
 
     # 3. GFF genomic coordinates
-    cds_positions, chrom = [], ''
+    cds_positions, chrom, strand = [], '', None
+    protein_id = args.protein_id
+    if not protein_id and args.gene_equiv_tsv:
+        equiv=load_gene_equiv(args.gene_equiv_tsv)
+        protein_id=equiv.get(gene) or equiv.get(gene.removesuffix('.Homo_sapiens'))
     if args.gff:
-        if args.protein_id:
-            protein_id = args.protein_id
-        elif args.gene_equiv_tsv:
-            equiv = load_gene_equiv(args.gene_equiv_tsv)
-            protein_id = equiv.get(gene)
-            if protein_id is None:
-                print(f'WARN {gene}: gene not found in {args.gene_equiv_tsv}; '
-                      f'hg38_nt_coord will be NA', file=sys.stderr)
-        else:
-            protein_id = gene
         if protein_id:
-            cds_positions, chrom = load_cds_positions(args.gff, protein_id)
+            cds_positions, chrom, strand = load_cds_positions(args.gff, protein_id, with_strand=True)
         if not cds_positions:
             print(f'WARN {gene}: protein_id "{protein_id}" not found in {args.gff}; '
                   f'hg38_nt_coord will be NA', file=sys.stderr)
@@ -283,7 +277,7 @@ def main():
     os.makedirs(os.path.dirname(args.out_tsv) or '.', exist_ok=True)
     with open(args.out_tsv, 'w') as fh:
         fh.write('ori_codon_col\tstatus\ttrim_codon_col\tprot_ali_col\t'
-                 'hg38_aa_pos\thg38_nt_coord\n')
+                 'hg38_aa_pos\thg38_nt_coord\thg38_nt_coord_2\thg38_nt_coord_3\tstrand\thuman_protein_id\thg38_codon\n')
         for col in all_cols:
             status = 'selected' if col in selected_set else 'removed'
             if status == 'selected':
@@ -298,12 +292,15 @@ def main():
             hg38_aa = str(aa_pos) if aa_pos is not None else 'NA'
 
             hg38_nt = 'NA'
+            nt2, nt3 = 'NA', 'NA'
+            coding = ref_seq[(col-1)*3:col*3] if ref_seq is not None else ''
+            if len(coding)!=3 or set(coding)-set('ACGTN'):coding='NA'
             if cds_positions and aa_pos is not None:
                 nt_idx = (aa_pos - 1) * 3  # 0-based index of first nt of this codon
-                if 0 <= nt_idx < len(cds_positions):
-                    hg38_nt = f'{chrom}:{cds_positions[nt_idx]}'
+                if 0 <= nt_idx and nt_idx+2 < len(cds_positions):
+                    hg38_nt, nt2, nt3 = [f'{chrom}:{p}' for p in cds_positions[nt_idx:nt_idx+3]]
 
-            fh.write(f'{col}\t{status}\t{trim_col}\t{prot_col}\t{hg38_aa}\t{hg38_nt}\n')
+            fh.write(f"{col}\t{status}\t{trim_col}\t{prot_col}\t{hg38_aa}\t{hg38_nt}\t{nt2}\t{nt3}\t{strand or 'NA'}\t{protein_id or 'NA'}\t{coding}\n")
 
     n_sel = len(selected)
     n_rem = len(removed)
