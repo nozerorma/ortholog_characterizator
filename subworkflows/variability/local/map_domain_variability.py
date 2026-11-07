@@ -14,7 +14,7 @@ A domtblout without that option needs --i_evalue_threshold, applied to the indep
 
 Inputs: --manifest  TSV, one gene per line: query name, entropy file, MAP file, CDS alignment file
                     (names relative to --var_dir, --map_dir and --cds_dir; the query name is the gene id
-                    of the entropy tables, <gene>.prot in the pipeline)
+                    of the entropy tables: <gene>, or <gene>.prot in tables of older runs)
 Output: domain_variability.tsv
   gene, pfam_id, target_name, description, clan_acc, clan_name, domain_instance, ali_start, ali_end,
   n_positions, n_analyzed, mean_variability, max_variability, mean_gap_fraction,

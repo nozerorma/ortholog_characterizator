@@ -61,6 +61,7 @@ while IFS=$'\t' read -r gene_id fasta_name; do
         # compute variability (script writes to ./PROT_VAR_RAW/<gene>.*)
         var_args=(
             --prot_ali    "$fasta_name"
+            --gene        "$gene_id"
             --taxid_tsv   "$taxid_tsv"
             --out_dir     "."
             --var_subdir  "PROT_VAR_RAW"

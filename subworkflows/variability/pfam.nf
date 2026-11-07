@@ -103,14 +103,14 @@ MANIFEST_EOF
 workflow PFAM {
 
     take:
-    entropy_ch       // tuple(gene_id, entropy_tsv); gene_id is <gene>.prot in a full run
+    entropy_ch       // tuple(gene_id, entropy_tsv); gene_id is <gene>, or <gene>.prot for tables of older runs
     cds_ch           // tuple(gene, codon alignment of the unfiltered CDS set)
     map_ch           // tuple(gene, BMGE position map)
 
     main:
 
     // gene_id keeps the id of the entropy tables, which every downstream join uses; CDS and MAP files
-    // are named after the bare gene.
+    // are named after the bare gene, so the .prot label that older entropy tables carry is dropped to join.
     genes_ch = entropy_ch
         .map { id, f -> tuple(id.replaceAll(/\.prot$/, ''), id, f) }
         .join(cds_ch)

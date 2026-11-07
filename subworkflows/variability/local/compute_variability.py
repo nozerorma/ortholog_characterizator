@@ -285,6 +285,10 @@ def main():
     parser.add_argument('--prot_ali', required=True)
     parser.add_argument('--taxid_tsv', required=True)
     parser.add_argument('--family_order_tsv', default=None)
+    parser.add_argument('--gene', default=None,
+                        help='Gene id of the outputs (default: --prot_ali file name without .fa). The pipeline '
+                             'passes the id of its channel, so the stage label of the staged file name '
+                             '(<gene>.prot.fa) does not enter the gene id')
     parser.add_argument('--out_dir', required=True)
     parser.add_argument('--alpha', type=float, default=1.0,
                         help='Exponent for symbol-diversity prong t (default 1)')
@@ -297,7 +301,7 @@ def main():
                              '(default: PROT_VAR; use PROT_VAR_RAW for raw branch)')
     args = parser.parse_args()
 
-    gene = os.path.basename(args.prot_ali).replace('.fa', '')
+    gene = args.gene or os.path.basename(args.prot_ali).replace('.fa', '')
     var_dir = os.path.join(args.out_dir, args.var_subdir)
     os.makedirs(var_dir, exist_ok=True)
 

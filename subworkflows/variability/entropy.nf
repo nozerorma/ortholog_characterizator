@@ -21,7 +21,12 @@ process VARIABILITY_BATCH {
     assert params.taxid_tsv : "ERROR: --taxid_tsv is required for the variability workflow (compute_variability.py)"
     def workers   = params.variability_batch_workers as int
     def fam_arg   = params.family_order_tsv ? "--family-order-tsv '${params.family_order_tsv}'" : ''
+    def producerHash = ['compute_variability.py', 'run_variability_batch.sh'].collect { name ->
+        java.security.MessageDigest.getInstance('SHA-256')
+            .digest(file("${projectDir}/subworkflows/variability/local/${name}").bytes)
+            .encodeHex().toString() }.join(' ')
     """
+    # Entropy producer SHA256: ${producerHash}
     cat > manifest.tsv << 'MANIFEST_EOF'
 ${manifest_text}
 MANIFEST_EOF
