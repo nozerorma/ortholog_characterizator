@@ -9,6 +9,8 @@ workflow VARIABILITY {
 
     take:
     prot_ch   // tuple(gene_id, prot_fasta) — translated protein alignments
+    cds_ch    // tuple(gene, codon alignment) — unfiltered CDS set; Pfam is scanned on its full-length human protein
+    map_ch    // tuple(gene, map_tsv) — BMGE position maps; project the Pfam hits onto the trimmed alignment
 
     main:
 
@@ -16,8 +18,9 @@ workflow VARIABILITY {
 
     if (params.run_hmmscan || params.hmmscan_domtblout) {
         PFAM(
-            prot_ch,
-            ENTROPY.out.entropy_tsv.collect { it[1] }
+            ENTROPY.out.entropy_tsv,
+            cds_ch,
+            map_ch
         )
         domain_tsv = PFAM.out.domain_tsv
     } else {

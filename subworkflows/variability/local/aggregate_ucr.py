@@ -11,13 +11,13 @@ Aggregate UCR windows (from detect_ucr.py) across all genes and produce:
   ucr_selection_summary.tsv  Per-UCR selection count summary (written only when
                              --fubar_sites or --fel_results is provided).
 
-Position cross-referencing for positive selection:
-  HyPhy site numbers are 1-based positions in the BMGE-trimmed protein alignment,
-  while entropy.tsv positions are 1-based raw protein alignment columns.  When
-  --map_dir is provided (*.map.tsv files from parse_bmge_track.py), the mapping
-  ori_codon_col → trim_codon_col is used to translate raw positions to HyPhy site
-  numbers.  Without MAP files, raw and trim positions are assumed equal (accurate
-  for genes where BMGE removed very few columns).
+Coordinates are declared by --alignment_coordinate_space. The native pipeline
+passes trimmed_alignment_1based because VARIABILITY consumes TRANSLATION.out.prot
+(BMGE), despite historical directory names PROT_RAW/PROT_VAR_RAW. UCR positions
+keep that 1-based index and export coordinate_space. HyPhy sites share that index.
+Only explicitly raw inputs use ori_codon_col -> trim_codon_col; missing mappings
+are not replaced by an assumed identity. Pfam overlaps use its exported alignment
+column mask, never the ungapped-query endpoints.
 
 Usage:
   python aggregate_ucr.py \\
@@ -217,12 +217,15 @@ def load_domain_tsv(path):
             gene = d.get('gene', '')
             if not gene:
                 continue
+            if d.get('coordinate_space') != 'CAAS_0based' or 'alignment_positions' not in d:
+                raise ValueError('Pfam annotation must declare explicit alignment_positions and CAAS_0based coordinates; regenerate MAP_DOMAIN_VARIABILITY')
             try:
                 hit = {
                     'pfam_id':         d['pfam_id'],
                     'domain_instance': int(d['domain_instance']),
                     'ali_start':       int(d['ali_start']),
                     'ali_end':         int(d['ali_end']),
+                    'alignment_positions': {int(c) for c in d['alignment_positions'].split(',') if c},
                 }
                 result.setdefault(gene, []).append(hit)
             except (ValueError, KeyError):
@@ -252,7 +255,7 @@ def region_type(pos, ucr):
 def find_domain(domain_list, pos):
     """Return pfam_id of the first overlapping domain hit, or None."""
     for hit in domain_list:
-        if hit['ali_start'] <= pos <= hit['ali_end']:
+        if pos - 1 in hit['alignment_positions']:
             return hit['pfam_id']
     return None
 
@@ -377,6 +380,9 @@ def main():
     ap.add_argument('--prot_dir',         required=True,
                     help='Directory containing *.fa raw protein MSA files (PROT_RAW)')
     ap.add_argument('--taxid_tsv',        required=True)
+    ap.add_argument('--alignment_coordinate_space', required=True,
+                    choices=['trimmed_alignment_1based', 'raw_alignment_1based'],
+                    help='Coordinate system of the supplied entropy/protein MSA; never inferred from a directory name')
     ap.add_argument('--out_dir',          required=True)
     ap.add_argument('--flank_size',       type=int,   default=5)
     ap.add_argument('--family_order_tsv', default=None)
@@ -404,7 +410,7 @@ def main():
             'n_positions\tmean_C_trident\tmin_C_trident\tmean_variability\tmean_gap\n'
         )
         open(os.path.join(args.out_dir, 'ucr_positions.tsv'), 'w').write(
-            'gene\tucr_id\tmethod\tposition\tregion_type\tC_trident\tvariability\tg\n'
+            'gene\tucr_id\tmethod\tposition\tregion_type\tC_trident\tvariability\tg\tcoordinate_space\n'
         )
         return
 
@@ -441,7 +447,7 @@ def main():
 
     # ── ucr_positions.tsv ─────────────────────────────────────────────────
     pos_base = ['gene', 'ucr_id', 'method', 'position', 'region_type',
-                'C_trident', 'variability', 'g']
+                'C_trident', 'variability', 'g', 'coordinate_space']
     pos_opt_dom  = ['pfam_domain']  if has_domain else []
     pos_opt_fub  = ['fubar_prob_pos', 'fubar_prob_neg', 'fubar_is_pos', 'fubar_is_neg'] \
                    if has_fubar else []
@@ -462,7 +468,7 @@ def main():
                     ent_row = ent.get(pos)
                     if ent_row is None:
                         continue
-                    hphy = gmap.get(pos, pos)  # fallback: raw pos == trim pos
+                    hphy = pos if args.alignment_coordinate_space == 'trimmed_alignment_1based' else gmap.get(pos)
                     fubar_row = fubar_data.get((gene, hphy), {})
                     fel_row   = fel_data.get((gene, hphy),   {})
 
@@ -471,6 +477,7 @@ def main():
                         'ucr_id':      ucr['ucr_id'],
                         'method':      ucr['method'],
                         'position':    pos,
+                        'coordinate_space': args.alignment_coordinate_space,
                         'region_type': region_type(pos, ucr),
                         'C_trident':   _fmt(ent_row['C_trident']),
                         'variability': _fmt(ent_row['variability']),
@@ -541,7 +548,7 @@ def main():
                 for pos in range(ucr['flank_start'], ucr['flank_end'] + 1):
                     if pos not in ent:
                         continue
-                    hphy    = gmap.get(pos, pos)
+                    hphy    = pos if args.alignment_coordinate_space == 'trimmed_alignment_1based' else gmap.get(pos)
                     is_core = ucr['start_pos'] <= pos <= ucr['end_pos']
                     if is_core:
                         n_core  += 1

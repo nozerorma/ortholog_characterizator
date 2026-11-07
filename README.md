@@ -154,6 +154,10 @@ Stages can be chained or run independently. If an upstream stage is skipped, poi
 | `--valdar_gamma` | `1.0` | Valdar entropy γ weight |
 | `--run_hmmscan` | `false` | Run hmmscan to annotate Pfam domains |
 | `--pfam_hmm` | — | Path to `Pfam-A.hmm` (required when `run_hmmscan=true`) |
+| `--hmmscan_domtblout` | — | Precomputed `domtblout`; it must come from `hmmscan --cut_ga` on the full-length human queries |
+| `--pfam_clans_tsv` | — | `Pfam-A.clans.tsv`, adds clan columns to the domain table |
+
+Pfam is scanned on the full-length human protein, translated from the unfiltered CDS alignment (`--cds_dir`), with the Pfam gathering thresholds (`hmmscan --cut_ga`, the curated criterion of Pfam). BMGE removes columns that are interior to the protein, and a query made of the trimmed human sequence joins stretches that are not contiguous in it. Each hit is projected onto the trimmed alignment through the MAP tables, so the Pfam step needs `--cds_dir` and the MAP tables (from the translation stage or `--map_dir`) besides the protein alignments. `reports/variability/domain_variability.tsv` keeps the hmmscan endpoints (`ali_start`, `ali_end`, on the full-length protein), the exact trimmed columns (`alignment_positions`) and the residues of the domain lost to trimming (`n_removed`).
 
 ### UCR analysis
 
@@ -257,6 +261,17 @@ Combine profiles with commas: `-profile slurm,singularity`
 ## Re-running / resuming
 
 Nextflow caches completed tasks. Add `-resume` (already included in the launcher scripts) to skip steps that finished successfully in a previous run.
+
+---
+
+## Re-running Pfam only
+
+```bash
+nextflow run main.nf -entry PFAM_ONLY --cds_dir <CDS alignments> --entropy_dir <PROT_VAR_RAW> --map_dir <MAP> \
+    --pfam_hmm <Pfam-A.hmm> --out_dir <new results dir> -profile slurm
+```
+
+This rewrites `HMMSCAN/hmmscan.domtblout` and `reports/variability/domain_variability.tsv` from the entropy tables and MAP tables of a finished run. Entropy, UCR detection, positive selection and the reports are not run again. The `pfam_domain` column of `ucr_positions.tsv` is taken from the Pfam table when UCR is aggregated, so it is updated only when that step is run again.
 
 ---
 

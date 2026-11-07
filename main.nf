@@ -15,6 +15,7 @@ include { QUALITY            } from './workflows/quality'
 include { TRANSLATION        } from './workflows/translation'
 include { PHYLOGENY          } from './workflows/phylogeny'
 include { VARIABILITY        } from './workflows/variability'
+include { PFAM               } from './subworkflows/variability/pfam'
 include { POSITIVE_SELECTION } from './workflows/positive_selection'
 include { UCR_ANALYSIS       } from './subworkflows/variability/ucr'
 include { TRANSLATION_REPORT } from './subworkflows/translation/report'
@@ -127,6 +128,12 @@ def make_cds_channel() {
     return ch.map { f -> tuple(f.baseName, f) }
 }
 
+// Every CDS alignment, unsampled: joins on the gene id keep only the genes of the other channel.
+def make_all_cds_channel() {
+    assert params.cds_dir : "ERROR: --cds_dir is required for the Pfam scan"
+    return Channel.fromPath("${params.cds_dir}/*.fa", checkIfExists: true).map { f -> tuple(f.baseName, f) }
+}
+
 def make_fallback_channel(String dir_param, String param_name, String glob = '*.fa') {
     assert params[dir_param] : "ERROR: upstream workflow was skipped — set --${dir_param} to point at existing ${param_name}"
     def ch = Channel.fromPath("${params[dir_param]}/${glob}", checkIfExists: true)
@@ -185,7 +192,15 @@ workflow {
             ? ch_prot
             : make_fallback_channel('prot_dir', 'PROT/bmge')
 
-        VARIABILITY( var_in )
+        // Pfam needs the unfiltered CDS alignments and the BMGE maps (see POSITION_COORDINATE_CONTRACT.md)
+        def pfam_on = params.run_hmmscan || params.hmmscan_domtblout
+        def pfam_cds_ch = pfam_on ? make_all_cds_channel() : Channel.empty()
+        def pfam_map_ch = !pfam_on ? Channel.empty()
+            : (params.run_translation
+               ? ch_map
+               : make_fallback_channel('map_dir', 'MAP', '*.map.tsv'))
+
+        VARIABILITY( var_in, pfam_cds_ch, pfam_map_ch )
     }
 
     // ── Positive selection ────────────────────────────────────────────────
@@ -298,4 +313,18 @@ workflow {
             gene_var_report_ch.ifEmpty(file('NO_GENE_VAR'))
         )
     }
+}
+
+// ── Pfam only ─────────────────────────────────────────────────────────────────
+// Rerun only the Pfam scan and its export on a finished run:
+//   nextflow run main.nf -entry PFAM_ONLY --cds_dir <CDS> --entropy_dir <PROT_VAR_RAW> --map_dir <MAP> --out_dir <new>
+
+workflow PFAM_ONLY {
+    assert params.entropy_dir : "ERROR: --entropy_dir (the <gene>.entropy.tsv tables of a variability run) is required"
+    assert params.map_dir     : "ERROR: --map_dir (the MAP/*.map.tsv tables of the translation run) is required"
+
+    entropy_ch = Channel.fromPath("${params.entropy_dir}/*.entropy.tsv", checkIfExists: true)
+        .map { f -> tuple(f.name.replace('.entropy.tsv', ''), f) }
+
+    PFAM( entropy_ch, make_all_cds_channel(), make_fallback_channel('map_dir', 'MAP', '*.map.tsv') )
 }

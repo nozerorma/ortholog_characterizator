@@ -57,10 +57,14 @@ process AGGREGATE_UCR {
                     ? "--family_order_tsv '${params.family_order_tsv}'"
                     : ''
     def alpha_arg = "--alpha ${params.valdar_alpha} --beta ${params.valdar_beta} --gamma ${params.valdar_gamma}"
+    def producerHash = java.security.MessageDigest.getInstance('SHA-256')
+        .digest(file("${projectDir}/subworkflows/variability/local/aggregate_ucr.py").bytes)
+        .encodeHex().toString()
     def dom_arg   = (domain_tsv.name  != 'NO_DOMAIN_TSV') ? "--domain_tsv '${domain_tsv}'"   : ''
     def fubar_arg = (fubar_sites.name != 'NO_FUBAR')       ? "--fubar_sites '${fubar_sites}'" : ''
     def fel_arg   = (fel_results.name != 'NO_FEL')         ? "--fel_results '${fel_results}'" : ''
     """
+    # UCR coordinate producer SHA256: ${producerHash}
     mkdir -p UCR_RAW PROT_VAR_RAW PROT_RAW MAP
 
     # Stage files into expected subdirectories
@@ -72,6 +76,7 @@ process AGGREGATE_UCR {
     python3 ${projectDir}/subworkflows/variability/local/aggregate_ucr.py \\
         --ucr_dir     UCR_RAW      \\
         --entropy_dir PROT_VAR_RAW \\
+        --alignment_coordinate_space trimmed_alignment_1based \\
         --prot_dir    PROT_RAW     \\
         --map_dir     MAP          \\
         --taxid_tsv   "${taxid_tsv}" \\
